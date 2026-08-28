@@ -1,0 +1,590 @@
+openapi: 3.0.3
+info:
+  title: Zevent Multi-Channel Extractor — External API
+  version: "2.0.0"
+  description: |
+    Every external HTTP/WS call this repo's `main.py` and `zevent_api.py` make (or could make)
+    while watching every Twitch channel in the current Zevent roster (300+) at once.
+
+    Chat isn't in this document at all: `main.py` reads it over anonymous Twitch IRC
+    (`wss://irc-ws.chat.twitch.tv:443`, no auth, `justinfan<random>` nick), sharded across
+    several connections (`CHANNELS_PER_IRC_CONNECTION`) — that's a raw IRC-over-WebSocket
+    protocol, not a REST/EventSub call, so there's nothing to describe as an OpenAPI path.
+
+    **A naming note** on `/eventsub/subscriptions` below (kept as `x-status: dropped`, see
+    that entry): it has nothing to do with the paid "channel Subscriptions" feature. Twitch
+    reuses the word "subscription" to mean "please notify me about this event".
+
+    Operations are tagged by access tier:
+    - **Public** — works for any channel with just the app's own token, no extra scope.
+    - **Broadcaster/Moderator-only** — only returns data if the authorizing account IS the
+      broadcaster, or a moderator, of the target channel. Not usable at Zevent's scale (300+
+      channels this project doesn't moderate) — kept here as `candidate` documentation only.
+
+    Each operation carries an `x-status` of:
+    - `in-use` — already called in this repo.
+    - `candidate` — documented here because it's useful for Zevent-style analysis, not wired
+      into the code.
+    - `dropped` — was called in an earlier, single-channel version of this project; removed
+      once the channel count made it impractical (see `x-dropped-reason` on that entry).
+servers:
+  - url: https://api.twitch.tv/helix
+    description: Twitch Helix
+
+tags:
+  - name: Twitch Helix — Public
+    description: No extra OAuth scope beyond the app's own token. Works for any public channel.
+  - name: Twitch Helix — Broadcaster/Moderator-only
+    description: Requires the authorizing account to be the channel's broadcaster or a moderator.
+  - name: Zevent
+    description: Public, unauthenticated JSON — every registered streamer at once.
+
+components:
+  securitySchemes:
+    ClientId:
+      type: apiKey
+      in: header
+      name: Client-Id
+    BotToken:
+      type: http
+      scheme: bearer
+      description: User access token obtained via Device Code Flow (see README).
+
+security:
+  - ClientId: []
+    BotToken: []
+
+paths:
+  /users:
+    get:
+      operationId: getUsers
+      tags: [Twitch Helix — Public]
+      summary: Get Users
+      description: >
+        Resolves channel logins to their numeric broadcaster_id, up to 100 per call. This repo
+        chunks the full Zevent roster (fetched from zevent.fr/api/) into batches of 100 to stay
+        under that limit.
+      x-status: in-use
+      x-used-by: >
+        main.py:242 — once at startup (event_ready), one call per 100-channel chunk of the
+        roster, to resolve every channel's broadcaster_id before joining IRC/polling streams.
+      parameters:
+        - name: login
+          in: query
+          required: true
+          schema: { type: array, items: { type: string } }
+          description: Twitch login name(s), not display name. Repeatable, up to 100.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - id: "89873316"
+                    login: terracid
+                    display_name: Terracid
+                    type: ""
+                    broadcaster_type: partner
+                    description: ""
+                    profile_image_url: "https://static-cdn.jtvnw.net/..."
+                    offline_image_url: ""
+                    view_count: 0
+                    created_at: "2015-05-13T18:14:52Z"
+
+  /streams:
+    get:
+      operationId: getStreams
+      tags: [Twitch Helix — Public]
+      summary: Get Streams
+      description: >
+        Title, category, viewer_count and started_at for a channel, if it's currently live.
+        Empty data[] means offline. Accepts up to 100 user_login values in one call — this repo
+        chunks the full Zevent roster into batches of 100 to poll every channel's live status in
+        a handful of calls instead of one per streamer.
+      x-status: in-use
+      x-used-by: >
+        main.py:332 (_poll_all_streams) — one call per 100-channel chunk, every
+        METADATA_SNAPSHOT_INTERVAL_SECONDS (default 15s). This is the only source of live
+        status/title/category/viewer_count now — no EventSub (see /eventsub/subscriptions).
+      parameters:
+        - name: user_login
+          in: query
+          required: true
+          schema: { type: array, items: { type: string } }
+          description: Channel login(s) to check.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - id: "41623654321"
+                    user_id: "89873316"
+                    user_login: terracid
+                    user_name: Terracid
+                    game_id: "509658"
+                    game_name: Just Chatting
+                    type: live
+                    title: "D'abord un peu de Coin Pusher puis REACT GTA 6 EXCLUSIF !!!"
+                    viewer_count: 4144
+                    started_at: "2026-08-27T14:02:11Z"
+                    language: fr
+                    thumbnail_url: "https://static-cdn.jtvnw.net/previews-ttv/live_user_terracid-{width}x{height}.jpg"
+                    tags: ["Français"]
+                    is_mature: false
+                pagination: {}
+
+  /eventsub/subscriptions:
+    post:
+      operationId: createEventSubSubscription
+      tags: [Twitch Helix — Public]
+      summary: Create EventSub Subscription (event webhook registration)
+      description: >
+        Registers interest in one event type. NOT related to the paid channel-Subscriptions
+        feature — see the naming note in the document description above. This call only
+        registers interest; the actual notification would be delivered later over an EventSub
+        WebSocket session.
+      x-status: dropped
+      x-dropped-reason: >
+        Used in an earlier, single-channel version of main.py: one call per type
+        (stream.online, stream.offline, channel.update, channel.raid) per channel, at startup.
+        At 300+ channels that's 1,200+ subscriptions, which risks hitting per-websocket
+        subscription limits — and everything it provided except raids (live status,
+        title/category) is already covered by the batched Get Streams poll (see /streams).
+        Replaced by pure Helix polling; raids are no longer tracked as a result.
+      x-formerly-used-by: >
+        main.py — one call per type per channel, made once at startup, before the
+        multi-channel rewrite.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            examples:
+              stream.online:
+                value:
+                  type: stream.online
+                  version: "1"
+                  condition: { broadcaster_user_id: "89873316" }
+                  transport: { method: websocket, session_id: "AgoQHUOKW7Cr..." }
+              stream.offline:
+                value:
+                  type: stream.offline
+                  version: "1"
+                  condition: { broadcaster_user_id: "89873316" }
+                  transport: { method: websocket, session_id: "AgoQHUOKW7Cr..." }
+              channel.update:
+                value:
+                  type: channel.update
+                  version: "2"
+                  condition: { broadcaster_user_id: "89873316" }
+                  transport: { method: websocket, session_id: "AgoQHUOKW7Cr..." }
+              channel.raid:
+                value:
+                  type: channel.raid
+                  version: "1"
+                  condition: { to_broadcaster_user_id: "89873316" }
+                  transport: { method: websocket, session_id: "AgoQHUOKW7Cr..." }
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              example:
+                data:
+                  - id: 26b1c993-bfcf-44d9-b876-379dacafe75e
+                    status: enabled
+                    type: stream.online
+                    version: "1"
+                    condition: { broadcaster_user_id: "89873316" }
+                    created_at: "2026-08-27T18:12:45Z"
+                    transport: { method: websocket, session_id: "AgoQHUOKW7Cr...", connected_at: "2026-08-27T18:12:44Z" }
+                    cost: 0
+                total: 1
+                total_cost: 1
+                max_total_cost: 10000
+
+  /clips:
+    get:
+      operationId: getClips
+      tags: [Twitch Helix — Public]
+      summary: Get Clips
+      description: >
+        Clips created for a channel in a date range. Zevent value: surfaces the moments viewers
+        found worth clipping — a cheap proxy for "highlight of the stream" without watching the
+        whole VOD back.
+      x-status: candidate
+      parameters:
+        - name: broadcaster_id
+          in: query
+          required: true
+          schema: { type: string }
+          description: Use the broadcaster_id already resolved via Get Users.
+        - name: started_at
+          in: query
+          required: false
+          schema: { type: string, format: date-time }
+          description: RFC3339 — restrict to clips made during this Zevent session.
+        - name: ended_at
+          in: query
+          required: false
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - id: AwkwardHelplessSalamanderSwiftRage
+                    url: "https://clips.twitch.tv/AwkwardHelplessSalamanderSwiftRage"
+                    broadcaster_id: "89873316"
+                    creator_name: ru_ma__
+                    video_id: "2094123456"
+                    game_id: "509658"
+                    title: "il a compris trop tard"
+                    view_count: 812
+                    created_at: "2026-08-27T15:41:02Z"
+                    duration: 28.3
+                pagination: {}
+
+  /videos:
+    get:
+      operationId: getVideos
+      tags: [Twitch Helix — Public]
+      summary: Get Videos
+      description: >
+        The published VOD once the stream ends. Zevent value: authoritative final duration and
+        view count, to cross-check the started_at/ended_at this repo computes from polling.
+      x-status: candidate
+      parameters:
+        - name: user_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: type
+          in: query
+          required: false
+          schema: { type: string, enum: [archive, highlight, upload] }
+          description: "archive = the auto-saved VOD of the stream itself."
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - id: "2094123456"
+                    user_id: "89873316"
+                    user_login: terracid
+                    title: "D'abord un peu de Coin Pusher puis REACT GTA 6 EXCLUSIF !!!"
+                    created_at: "2026-08-27T14:02:11Z"
+                    published_at: "2026-08-27T14:02:11Z"
+                    duration: 8h12m40s
+                    view_count: 51200
+                    type: archive
+                pagination: {}
+
+  /games/top:
+    get:
+      operationId: getTopGames
+      tags: [Twitch Helix — Public]
+      summary: Get Top Games
+      description: >
+        The categories with the most total viewers on Twitch right now. Zevent value: gives a
+        this-channel-vs-the-platform baseline — is the streamer's category trending network-wide,
+        or is their viewer count purely a Zevent effect?
+      x-status: candidate
+      parameters:
+        - name: first
+          in: query
+          required: false
+          schema: { type: integer, default: 20, maximum: 100 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - id: "509658"
+                    name: Just Chatting
+                    box_art_url: "https://static-cdn.jtvnw.net/ttv-boxart/509658-{width}x{height}.jpg"
+                pagination: {}
+
+  /chat/chatters:
+    get:
+      operationId: getChatters
+      tags: [Twitch Helix — Broadcaster/Moderator-only]
+      summary: Get Chatters
+      description: >
+        The full list of accounts currently connected to chat — not just people who typed a
+        message. This is the "viewer typology" data point the README's "Not implemented" section
+        already flags as needing a moderator token. Only usable if you're monitoring your own
+        channel or one where you moderate.
+      x-status: candidate
+      x-twitch-scope: moderator:read:chatters
+      parameters:
+        - name: broadcaster_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: moderator_id
+          in: query
+          required: true
+          schema: { type: string }
+          description: Must be the user ID of the token's own account.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - user_id: "111111111"
+                    user_login: elcailloulefou
+                    user_name: elcailloulefou
+                pagination: {}
+                total: 3218
+
+  /channels/followers:
+    get:
+      operationId: getChannelFollowers
+      tags: [Twitch Helix — Broadcaster/Moderator-only]
+      summary: Get Channel Followers
+      description: Follower count and list. Zevent value — follower growth during the marathon.
+      x-status: candidate
+      x-twitch-scope: moderator:read:followers
+      parameters:
+        - name: broadcaster_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                total: 184302
+                data:
+                  - user_id: "111111111"
+                    user_login: elcailloulefou
+                    user_name: elcailloulefou
+                    followed_at: "2026-08-27T15:02:00Z"
+
+  /hypetrain/events:
+    get:
+      operationId: getHypeTrainEvents
+      tags: [Twitch Helix — Broadcaster/Moderator-only]
+      summary: Get Hype Train Events
+      description: >
+        Hype Trains are triggered by bursts of subs, gift subs and bits. Zevent value: a
+        ready-made "donation/support spike" signal, timestamped, without parsing chat.
+      x-status: candidate
+      x-twitch-scope: channel:read:hype_train
+      parameters:
+        - name: broadcaster_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - id: 1b0AsbInCHZW2SQFQdzq1JVjhOs
+                    event_type: hypetrain.progression
+                    event_timestamp: "2026-08-27T16:22:00Z"
+                    event_data:
+                      broadcaster_id: "89873316"
+                      level: 2
+                      total: 700
+                      progress: 200
+                      goal: 1000
+                pagination: {}
+
+  /bits/leaderboard:
+    get:
+      operationId: getBitsLeaderboard
+      tags: [Twitch Helix — Broadcaster/Moderator-only]
+      summary: Get Bits Leaderboard
+      description: Top cheerers for the broadcaster. Zevent value — a second donation-adjacent signal alongside Hype Train events.
+      x-status: candidate
+      x-twitch-scope: bits:read
+      parameters:
+        - name: period
+          in: query
+          required: false
+          schema: { type: string, enum: [day, week, month, year, all], default: all }
+        - name: started_at
+          in: query
+          required: false
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - user_id: "111111111"
+                    user_login: elcailloulefou
+                    user_name: elcailloulefou
+                    rank: 1
+                    score: 11800
+                date_range: { started_at: "2026-08-27T00:00:00Z", ended_at: "2026-08-29T00:00:00Z" }
+                total: 10
+
+  /polls:
+    get:
+      operationId: getPolls
+      tags: [Twitch Helix — Broadcaster/Moderator-only]
+      summary: Get Polls
+      description: Channel-points polls the broadcaster ran, with vote counts per choice. Zevent value — a direct read of what the audience voted for.
+      x-status: candidate
+      x-twitch-scope: channel:read:polls
+      parameters:
+        - name: broadcaster_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - id: ed961efd-8a3f-4cf5-a9d0-e616c590cd2a
+                    title: "Prochain jeu ?"
+                    choices:
+                      - { id: "1", title: "Coin Pusher", votes: 4102 }
+                      - { id: "2", title: "GTA 6 réactions", votes: 6890 }
+                    status: COMPLETED
+                    started_at: "2026-08-27T16:00:00Z"
+                    ended_at: "2026-08-27T16:05:00Z"
+                pagination: {}
+
+  /predictions:
+    get:
+      operationId: getPredictions
+      tags: [Twitch Helix — Broadcaster/Moderator-only]
+      summary: Get Predictions
+      description: Channel-points predictions the broadcaster ran. Zevent value — engagement volume and outcome accuracy per prediction.
+      x-status: candidate
+      x-twitch-scope: channel:read:predictions
+      parameters:
+        - name: broadcaster_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - id: bc637af0-7766-4525-9c06-35f8afb3907a
+                    title: "Il gagne la roulette russe ?"
+                    outcomes:
+                      - { id: "1", title: "Oui", users: 3021, channel_points: 512000 }
+                      - { id: "2", title: "Non", users: 5210, channel_points: 890000 }
+                    status: RESOLVED
+                    created_at: "2026-08-27T17:10:00Z"
+                pagination: {}
+
+  /charity/campaigns:
+    get:
+      operationId: getCharityCampaign
+      tags: [Twitch Helix — Broadcaster/Moderator-only]
+      summary: Get Charity Campaign
+      description: >
+        Only returns data if the streamer is running Twitch's own built-in Charity tool for
+        Zevent, rather than (or alongside) zevent.fr's own donation tracker. Worth checking
+        per-streamer since this varies.
+      x-status: candidate
+      x-twitch-scope: channel:read:charity
+      parameters:
+        - name: broadcaster_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - id: 123-abc-456-def
+                    charity_name: "Amnesty International France"
+                    current_amount: { value: 1500000, decimal_places: 2, currency: EUR }
+                    target_amount: { value: 4000000, decimal_places: 2, currency: EUR }
+
+  /charity/donations:
+    get:
+      operationId: getCharityCampaignDonations
+      tags: [Twitch Helix — Broadcaster/Moderator-only]
+      summary: Get Charity Campaign Donations
+      description: Individual donation events for a Twitch-native charity campaign (see Get Charity Campaign above for the caveat on whether a streamer uses this vs. zevent.fr).
+      x-status: candidate
+      x-twitch-scope: channel:read:charity
+      parameters:
+        - name: broadcaster_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - id: 3f4c1f36-8a1c-4c1e-8f2e-1c1a1e1a1e1a
+                    campaign_id: 123-abc-456-def
+                    user_id: "111111111"
+                    user_login: elcailloulefou
+                    amount: { value: 500, decimal_places: 2, currency: EUR }
+                pagination: {}
+
+  /api/:
+    servers:
+      - url: https://zevent.fr
+        description: Zevent public API
+    get:
+      operationId: getZeventSnapshot
+      tags: [Zevent]
+      security: []
+      summary: Get Zevent Snapshot
+      description: >
+        Online status, viewer count and cumulative donation amount for every registered streamer
+        at once, across the whole event. Cached server-side for ~15s.
+      x-status: in-use
+      x-used-by: >
+        zevent_api.py:96 (poll_forever) — polled every ZEVENT_API_POLL_INTERVAL_SECONDS
+        (default 20s). Also the source of main.py's channel roster (fetch_snapshot, called once
+        at startup) — see main.py's _fetch_roster.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                websiteMode: live
+                donationAmount: { number: 128340.0 }
+                viewersCount: { number: 812345 }
+                live:
+                  - twitch_id: "89873316"
+                    twitch: terracid
+                    display: Terracid
+                    profileUrl: "https://static-cdn.jtvnw.net/jtv_user_pictures/89873316-profile_image-300x300.png"
+                    online: true
+                    game: Just Chatting
+                    viewersAmount: { number: 4144 }
+                    donationAmount: { number: 15230.5 }

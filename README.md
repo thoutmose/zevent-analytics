@@ -1,74 +1,357 @@
 # twitch-analytics
 
-Two same-day test scripts for Zevent-style aggregation. Each prints
-aggregated stats as JSON on every poll so you can check the data is correct
-before wiring it into Airflow/NiFi — they're independent extraction tasks,
-run separately.
+![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
+![uv](https://img.shields.io/badge/uv-package%20manager-DE5FE9?logo=uv&logoColor=white)
+![TwitchIO](https://img.shields.io/badge/TwitchIO-3.x-9146FF?logo=twitch&logoColor=white)
+![aiohttp](https://img.shields.io/badge/aiohttp-async%20HTTP-2C5BB4)
+![PyArrow](https://img.shields.io/badge/PyArrow-Parquet%20%2B%20zstd-150458)
+![Apache NiFi](https://img.shields.io/badge/Apache%20NiFi-1.24-728E9B?logo=apachenifi&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-4169E1?logo=postgresql&logoColor=white)
+![PgBouncer](https://img.shields.io/badge/PgBouncer-connection%20pooling-4169E1)
+![Docker Compose](https://img.shields.io/badge/Docker%20Compose-NiFi%20stack-2496ED?logo=docker&logoColor=white)
+![Ruff](https://img.shields.io/badge/lint%20%2F%20format-Ruff-D7FF64?logo=ruff&logoColor=black)
+![ty](https://img.shields.io/badge/type%20check-ty-FCA121)
 
-- `main.py` — deep-dive on **one Twitch channel** via TwitchIO: chat volume,
-  subs, raids, viewer count over time, stream title, category, duration.
-- `zevent_api.py` — **all Zevent streamers at once** via the official
-  `zevent.fr/api/`: online/offline status, viewer count, donation amount.
+Extracts live-stream data for every Twitch channel participating in
+[Zevent](https://zevent.fr/) — chat, viewer counts, stream metadata, and the
+event's own donation/streamer feed — and lands it in a PostgreSQL bronze
+layer through an Apache NiFi ingestion pipeline, with a local Parquet copy
+of everything along the way.
 
-## `main.py` setup
+## Table of contents
 
-1. Register a Twitch application at https://dev.twitch.tv/console/apps.
-   Set **Category** to `Application Integration` and **Client Type** to
-   `Public` (Device Code Flow needs a public client — no client secret).
-2. Copy `.env.example` to `.env` and fill in `TWITCH_CLIENT_ID` and
-   `TWITCH_CHANNEL` (the channel's login name, e.g. `zerator`, not its
-   display name).
-3. Install dependencies: `uv sync`
-4. Run: `uv run main.py`
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Design decisions](#design-decisions)
+- [Reliability mechanisms](#reliability-mechanisms)
+- [Performance](#performance)
+- [Project structure](#project-structure)
+- [Getting started](#getting-started)
+  - [Prerequisites](#prerequisites)
+  - [1. Register a Twitch application](#1-register-a-twitch-application)
+  - [2. Configure environment variables](#2-configure-environment-variables)
+  - [3. Bring up the NiFi stack](#3-bring-up-the-nifi-stack)
+  - [4. Apply the database schema](#4-apply-the-database-schema)
+  - [5. Build the NiFi flow](#5-build-the-nifi-flow)
+  - [6. Run the extractors](#6-run-the-extractors)
+- [Configuration reference](#configuration-reference)
+- [Data model](#data-model)
+- [Logging](#logging)
+- [Development](#development)
+- [Known limitations](#known-limitations)
 
-On first run it prints a URL — open it, log in with a Twitch account, and
-authorize the app (Device Code Flow). The authorized token is cached in
-`.tio.tokens.json` so you won't have to re-authorize on later runs.
+## Overview
 
-## What gets collected, and what each requires
+Two independent extractors feed the same pipeline:
 
-| Data | Source | Auth requirement |
+| Script | Watches | Source | Auth |
+|---|---|---|---|
+| [`main.py`](main.py) | Every channel in the current Zevent roster (300+) | Twitch Helix (batched polling) + anonymous IRC (sharded connections) | Device Code Flow, app-only |
+| [`zevent_api.py`](zevent_api.py) | The whole event at once | [`zevent.fr/api/`](https://zevent.fr/api/), public/unauthenticated | none |
+
+Both push their batches to an [Apache NiFi](https://nifi.apache.org/) flow
+over HTTP (`NIFI_WEBHOOK_URL`) which routes, splits, and writes them into
+PostgreSQL — see [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design
+rationale (batching, backpressure, idempotency, dead-lettering). Left
+unset, both scripts still run standalone and land Parquet files locally —
+NiFi is an additive sink, not a hard dependency.
+
+`main.py` no longer targets a single hardcoded channel: it fetches the
+current Zevent streamer list from `zevent.fr/api/` at startup and watches
+all of them. EventSub (`stream.online`/`offline`, `channel.update`,
+`channel.raid`) was dropped in favor of pure Helix polling once the channel
+count crossed into the hundreds — subscribing to 3–4 events per channel
+risks per-websocket subscription limits at that scale. Raids aren't tracked
+as a result.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Sources
+        TW["Twitch<br/>(Helix + anonymous IRC)"]
+        ZV["zevent.fr/api/"]
+    end
+
+    subgraph "Python extractors"
+        MAIN["main.py<br/>(sharded IRC + batched Helix poll)"]
+        ZAPI["zevent_api.py<br/>(event-wide snapshot)"]
+    end
+
+    subgraph "Local landing zone"
+        PARQUET[("Parquet files<br/>data/live_chat/, data/metadata/")]
+    end
+
+    subgraph "Apache NiFi (srv-prod)"
+        LISTEN["ListenHTTP :8080"]
+        EJP["EvaluateJsonPath<br/>(promote stream attr)"]
+        MERGE["MergeContent<br/>(correlate by stream)"]
+        ROUTE["RouteOnAttribute"]
+        SPLIT["SplitJson<br/>(rows → 1 flowfile each)"]
+        PUTDB["PutDatabaseRecord"]
+        DEADLETTER[("PutFile<br/>dead-letter")]
+    end
+
+    subgraph "srv-db"
+        PGB["PgBouncer :6432"]
+        PG[("PostgreSQL<br/>bronze_* tables")]
+    end
+
+    TW --> MAIN
+    ZV --> ZAPI
+    ZV -.roster at startup.-> MAIN
+    MAIN --> PARQUET
+    MAIN -- NIFI_WEBHOOK_URL --> LISTEN
+    ZAPI -- NIFI_WEBHOOK_URL --> LISTEN
+    LISTEN --> EJP --> MERGE --> ROUTE --> SPLIT --> PUTDB
+    PUTDB -- success --> PG
+    PUTDB -- failure --> DEADLETTER
+    PGB --> PG
+    PUTDB -.via PgBouncer.-> PGB
+```
+
+`srv-prod` runs NiFi only; PostgreSQL and PgBouncer run on a separate
+`srv-db` and aren't managed by this repo. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for the deployment topology, the
+reverse-proxy setup, and every deviation from the original design.
+
+## Design decisions
+
+### Why Apache NiFi
+
+The pipeline needs an HTTP ingestion endpoint, per-batch routing by data
+type, and a database sink with a dead-letter path for failures. NiFi
+provides all of that as configurable processors (`ListenHTTP`,
+`RouteOnAttribute`, `PutDatabaseRecord`, `PutFile`) instead of code this
+project would otherwise have to write and operate itself — a message
+broker (Kafka or similar) would still need a consumer and a
+database-writing sink built on top of it for the same result. The
+trade-off is that NiFi's flow lives in its own UI/REST API rather than in
+version-controlled code — mitigated here by documenting every processor's
+configuration in [`ARCHITECTURE.md`](ARCHITECTURE.md) since no flow export
+can be validated without a running instance to import it into.
+
+### Why PostgreSQL + JSONB
+
+PostgreSQL and PgBouncer were the given target (see
+[`ARCHITECTURE.md`](ARCHITECTURE.md)), not something this project
+evaluated against alternatives. It's a good fit for what's actually
+needed: `UNIQUE (batch_id, row_number)` gives exactly-once semantics on
+replay for free, and `jsonb` holds `zevent_api.py`'s per-streamer array
+(`bronze_zevent_snapshots.streamers`) without a rigid one-column-per-field
+schema. Nothing here is written to be queried at analytical scale — it's a
+bronze/raw landing layer, not a warehouse.
+
+### Why Parquet as a dual-write, not just a local cache
+
+`main.py` wrote Parquet before NiFi/PostgreSQL entered the picture at all
+— `nifi_client.py`'s own docstring calls it "an additive sink, not a
+replacement". Keeping the Parquet write means the extraction survives
+NiFi being down, misconfigured, or not deployed yet, and gives a
+zstd-compressed local copy to re-derive from independent of the DB. The
+trade-off is the two sinks can disagree if one push fails and the other
+doesn't (see [Known limitations](#known-limitations)) — acceptable for a
+bronze layer that's meant to be replayed, not treated as a single source
+of truth.
+
+## Reliability mechanisms
+
+What's actually implemented and testable in this repo, as of the latest
+multi-channel rewrite:
+
+- **Idempotent replay** — every row carries `batch_id` + `row_number`;
+  `UNIQUE (batch_id, row_number)` (`sql/001_bronze_schema.sql`) makes a
+  re-sent batch a no-op instead of a duplicate.
+- **Dead-lettering, not data loss** — `PutDatabaseRecord`'s `failure`
+  relationship routes to a `PutFile` processor writing into
+  `nifi/dead-letter/`, so a bad row is captured on disk instead of
+  silently dropped.
+- **Graceful shutdown waits for in-flight pushes** —
+  [`nifi_client.wait_for_pending_pushes`](nifi_client.py) is awaited
+  before the event loop closes, so a NiFi push isn't cancelled mid-request
+  (a cancelled-but-already-sent request is ambiguous — see that
+  function's docstring for the double-insert this prevents).
+- **IRC sharded across reconnecting connections** — each
+  [`ChatConnection`](main.py) covers `CHANNELS_PER_IRC_CONNECTION`
+  channels and reconnects with exponential backoff on drop, so one flaky
+  connection only affects its own shard, not the whole roster.
+- **Rate-limit-aware fan-out** — Helix calls (`Get Users`/`Get Streams`)
+  are chunked to 100 logins per request (Twitch's own limit); IRC `JOIN`s
+  are paced (`IRC_JOIN_PACING_SECONDS`) to stay under Twitch's per-10s
+  connection limit.
+- **NiFi's built-in per-connection backpressure** — every connection
+  between processors has an object/size threshold NiFi enforces natively;
+  none have been load-tested against real Zevent traffic yet (see
+  [Performance](#performance) below).
+
+## Performance
+
+Not yet measured under real load — Zevent hasn't happened yet on this
+timeline. This section will be filled in after the event with real
+numbers pulled from `logging/` (see [Logging](#logging)) and PostgreSQL
+itself (row counts, `nifi/dead-letter/` contents, restart count), not
+projected or assumed ones. Planned to report: sustained throughput,
+dead-letter rate, IRC reconnect count per shard, and whether any manual
+restart was needed over the event's full duration.
+
+## Project structure
+
+```
+.
+├── main.py                  # multi-channel Twitch extractor (chat + metadata)
+├── zevent_api.py             # zevent.fr/api/ poller (event-wide snapshot)
+├── nifi_client.py             # shared HTTP push helper (batching, retries-safe)
+├── logging_setup.py           # loads logging.yaml, picks dev/prod handler profile
+├── logging.yaml                # rotating file handlers + colored console
+├── sql/001_bronze_schema.sql    # PostgreSQL bronze tables (applied on srv-db)
+├── docker-compose.yml            # local NiFi stack (srv-prod only)
+├── nifi/dead-letter/               # PutDatabaseRecord failures land here
+├── drivers/                          # PostgreSQL JDBC driver, mounted into NiFi
+├── openapi.yaml                        # every external Twitch API call, documented
+├── ARCHITECTURE.md                       # target production pipeline, in depth
+└── data/                                   # local Parquet output (gitignored)
+```
+
+## Getting started
+
+### Prerequisites
+
+- Python 3.12+ and [uv](https://docs.astral.sh/uv/)
+- Docker + Docker Compose (for the local NiFi stack)
+- A reachable PostgreSQL instance behind PgBouncer (see
+  [`ARCHITECTURE.md`](ARCHITECTURE.md) — not provisioned by this repo)
+
+### 1. Register a Twitch application
+
+At https://dev.twitch.tv/console/apps — set **Category** to `Application
+Integration` and **Client Type** to `Public` (Device Code Flow needs a
+public client, no client secret).
+
+### 2. Configure environment variables
+
+```bash
+cp .env.example .env
+```
+
+Fill in `TWITCH_CLIENT_ID` at minimum. See
+[Configuration reference](#configuration-reference) below for everything
+else — most have sane defaults.
+
+### 3. Bring up the NiFi stack
+
+```bash
+uv sync
+docker compose up -d
+```
+
+NiFi's UI/API is served over HTTPS at `https://localhost:8443` (self-signed
+cert; single-user login only works over HTTPS — see
+[`ARCHITECTURE.md`](ARCHITECTURE.md#4-notes-on-this-implementation-deviations-from-the-original-spec)
+for why). The data-ingestion port (`ListenHTTP`) is `localhost:8888`.
+
+### 4. Apply the database schema
+
+```bash
+psql "postgresql://<user>@<srv-db-host>:5432/zevent" -f sql/001_bronze_schema.sql
+```
+
+### 5. Build the NiFi flow
+
+This repo doesn't ship an exported NiFi template (a hand-authored one can't
+be validated without a running instance to import it into). Build it per
+the [Architecture](#architecture) diagram above — `ListenHTTP` →
+`EvaluateJsonPath` → `MergeContent` → `RouteOnAttribute` → `SplitJson` →
+`PutDatabaseRecord` (+ dead-letter `PutFile` on failure). Full processor
+configuration is in [`ARCHITECTURE.md`](ARCHITECTURE.md#2-how-the-pieces-in-this-repo-map-onto-the-diagram).
+
+### 6. Run the extractors
+
+```bash
+uv run main.py         # every Zevent channel: chat + metadata
+uv run zevent_api.py   # event-wide snapshot (donations, viewer counts)
+```
+
+Each is independent — run one, the other, or both. On first run, `main.py`
+prints a Device Code Flow URL: open it, log in, authorize. The token is
+cached in `.tio.tokens.json` so later runs don't need to re-authorize
+(as long as the process shuts down cleanly — see
+[`nifi_client.wait_for_pending_pushes`](nifi_client.py)).
+
+## Configuration reference
+
+All variables live in `.env` (see [`.env.example`](.env.example) for the
+authoritative, commented list). Highlights:
+
+| Variable | Default | Purpose |
 |---|---|---|
-| Title, category, viewer count, live/offline, duration | Helix API poll + `channel.update`/`stream.online`/`stream.offline` EventSub | none beyond the app's own token — works for any public channel |
-| Chat messages, per-chatter message counts | `channel.chat.message` EventSub | just `user:read:chat` scope from whoever authorizes via DCF — works for **any** channel, not just ones you own or moderate |
-| Raids received | `channel.raid` EventSub | none — works for any channel |
-| Subs | `channel.subscribe` EventSub | the authorized account must **be** the broadcaster — `channel:read:subscriptions` can only be granted by the channel owner, so this fails for a channel you don't own |
+| `TWITCH_CLIENT_ID` | *(required)* | Twitch app client ID |
+| `CHANNELS_PER_IRC_CONNECTION` | `50` | Channels per anonymous IRC connection (sharded across `ceil(n / this)` connections) |
+| `IRC_JOIN_PACING_SECONDS` | `0.5` | Delay between IRC `JOIN`s, to respect Twitch's rate limit |
+| `METADATA_SNAPSHOT_INTERVAL_SECONDS` | `15` | Batched Helix poll interval (all channels, all metadata) |
+| `ZEVENT_API_POLL_INTERVAL_SECONDS` | `20` | `zevent.fr/api/` poll interval |
+| `FLUSH_INTERVAL_SECONDS` | `30` | How often buffered rows are flushed to Parquet/NiFi |
+| `MAX_ROWS_PER_PARQUET_FILE` | `100000` | Row cap before a Parquet file rolls over |
+| `PARQUET_COMPRESSION` | `zstd` | Codec passed to `pyarrow.parquet.write_table` |
+| `PARQUET_OUTPUT_DIR` | `data` | Local Parquet landing zone |
+| `NIFI_WEBHOOK_URL` | *(unset)* | NiFi `ListenHTTP` endpoint; unset = Parquet/stdout only |
+| `APP_ENV` | `development` | Logging profile — see [Logging](#logging) |
+| `NIFI_ADMIN_USERNAME` / `NIFI_ADMIN_PASSWORD` | — | NiFi UI single-user login (docker-compose) |
 
-So everything works out of the box for any `TWITCH_CHANNEL` except subs,
-which only works when you're testing against your own channel. The script
-logs a warning and keeps running with everything else if a subscription is
-rejected.
+## Data model
 
-### `main.py` output
+Three bronze tables in PostgreSQL (`sql/001_bronze_schema.sql`), one per
+`stream` value pushed through NiFi. Every row carries `batch_id` +
+`row_number`; `UNIQUE (batch_id, row_number)` makes a replayed batch a
+no-op instead of a duplicate.
 
-Every poll interval (`TWITCH_POLL_INTERVAL_SECONDS`, default 60s) and on
-stream offline, the script logs a `STATS {...}` JSON line with the full
-aggregate for the current session — that's the shape to hand to
-NiFi/Airflow once you're happy with it.
+| Table | Fed by | Notable columns |
+|---|---|---|
+| `bronze_live_chat` | `main.py` (IRC) | `channel`, `chatter`, `chatter_id`, `text`, `message_sent_at`, `captured_at` |
+| `bronze_metadata_snapshots` | `main.py` (Helix poll) | `channel`, `is_live`, `title`, `category`, `viewer_count`, `duration_seconds`, `stream_started_at`, `snapshot_at` |
+| `bronze_zevent_snapshots` | `zevent_api.py` | `website_mode`, `total_donation_amount_eur`, `total_viewer_count`, `streamers` (`jsonb`: `twitch_id`, `twitch_login`, `display_name`, `profile_url`, `online`, `game`, `viewer_count`, `donation_amount_eur` per streamer) |
 
-## `zevent_api.py`
+## Logging
 
-No Twitch auth needed — `zevent.fr/api/` is a public, unauthenticated JSON
-endpoint listing every registered streamer at once. Run: `uv run zevent_api.py`
+Configured centrally by [`logging_setup.py`](logging_setup.py) from
+[`logging.yaml`](logging.yaml) — every module logger (`zevent_extractor`,
+`nifi_client`, `zevent_api`, `twitchio.*`) propagates to the root logger,
+which is what actually determines where output goes.
 
-Every poll interval (`ZEVENT_API_POLL_INTERVAL_SECONDS`, default 20s — the
-API itself caches for ~15s, so don't go much below that) it logs a
-`STATS {...}` JSON line with:
+Two profiles, selected via `APP_ENV`:
 
-- `website_mode` — `"offline"` outside the event, `"live"` during it
-- `total_donation_amount_eur`, `total_viewer_count` — event-wide totals
-- `streamers[]` — per streamer: `twitch_id`, `twitch_login`, `display_name`,
-  `online`, `game` (category, or `"Offline"`), `viewer_count`,
-  `donation_amount_eur`
+- **`development`** (default) — colored console, plus rotating files under
+  `logging/`: `info.log`, `warn.log`, `errors.log`, `critical.log`,
+  `debug.log`.
+- **`production`** — console + `logging/info.log` only.
 
-**Not available from this API:** a donation *count* (number of individual
-donations) — only the cumulative euro amount is exposed, per streamer and
-globally. `stats.zevent.fr` looked like it might have more detail but sits
-behind an interactive Cloudflare bot-challenge, so it isn't scraped here.
+Each file rotates at 10 MB, keeping 20 backups.
 
-## Not implemented
+## Development
 
-"Viewer typology" (e.g. lurker vs. chatter, new vs. returning) — Twitch's
-API doesn't expose a full viewer list, only active chatters via a
-moderator-only endpoint. Flag if you want this added on top of a moderator
-token.
+```bash
+uv run ruff format .   # formatting
+uv run ruff check .    # linting
+uv run ty check .      # static type checking
+```
+
+All three are expected to pass clean on every file in this repo.
+
+## Known limitations
+
+- **Parquet and PostgreSQL can drift.** The Parquet file is written first,
+  then pushed to NiFi — if that push fails or times out, the row exists
+  locally but not (yet, or ever) in Postgres. Failures NiFi does receive
+  land in `nifi/dead-letter/` for manual replay; nothing reconciles the two
+  sinks automatically.
+- **Roster is fetched once at startup.** If `zevent.fr/api/` adds or
+  removes a streamer mid-event, `main.py` needs a restart to pick it up —
+  no live re-sharding of IRC connections.
+- **No raid tracking.** Dropped along with EventSub when the channel count
+  made per-channel subscriptions impractical (see [Overview](#overview)).
+- **No donation *count*.** `zevent.fr/api/` exposes cumulative donation
+  *amount* only, per streamer and event-wide — not a count of individual
+  donations. `stats.zevent.fr` has more detail but sits behind an
+  interactive bot-challenge that isn't scripted around here.
+- **No "viewer typology"** (lurker vs. chatter, new vs. returning) — Twitch
+  doesn't expose a full viewer list, only active chatters, and only via a
+  moderator-only endpoint.

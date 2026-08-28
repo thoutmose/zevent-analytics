@@ -1,11 +1,14 @@
 [project]
 name = "twitch-analytics"
 version = "0.1.0"
-description = "Add your description here"
+description = "Multi-channel Zevent/Twitch extractor feeding a NiFi -> PostgreSQL bronze pipeline"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "twitchio>=3.3.2",
     "python-dotenv>=1.0",
     "aiohttp>=3.9",
+    "pyarrow>=25.0.1",
+    "colorlog>=6.12.0",
+    "pyyaml>=6.0.3",
 ]

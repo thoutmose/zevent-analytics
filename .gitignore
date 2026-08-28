@@ -13,4 +13,10 @@ wheels/
 .env
 .tio.tokens.json
 
+# Parquet output landing zone (one file per chat message/metadata snapshot)
+data/
+
+# Rotating log files (see logging.yaml / logging_setup.py)
+logging/
+
 .claude/

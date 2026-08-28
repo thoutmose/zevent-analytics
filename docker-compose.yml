@@ -1,0 +1,35 @@
+services:
+  nifi:
+    image: apache/nifi:1.24.0
+    container_name: zevent-nifi
+    ports:
+      # 8443: NiFi's own UI/REST API. Single-user login only works over HTTPS — over
+      # plain HTTP it silently grants anonymous access instead of prompting for
+      # credentials. See ARCHITECTURE.md, "Notes on this implementation".
+      - "8443:8443"
+      # Host 8888 -> container 8080: the ListenHTTP processor's data-ingestion port
+      # (§2.A) — unrelated to the UI port above, this is a plain HTTP endpoint the flow
+      # listens on for NIFI_WEBHOOK_URL pushes from main.py / zevent_api.py. Host side
+      # moved off 8080 because that's already taken by cadvisor on srv-prod.
+      - "8888:8080"
+    environment:
+      NIFI_WEB_HTTPS_PORT: "8443"
+      # Requests forwarded by the external reverse proxy carry Host: nifi.thoutmose.me —
+      # NiFi rejects any request whose Host doesn't match this allowlist.
+      NIFI_WEB_PROXY_HOST: ${NIFI_WEB_PROXY_HOST:-nifi.thoutmose.me}
+      SINGLE_USER_CREDENTIALS_USERNAME: ${NIFI_ADMIN_USERNAME:-admin}
+      SINGLE_USER_CREDENTIALS_PASSWORD: ${NIFI_ADMIN_PASSWORD:?set NIFI_ADMIN_PASSWORD in .env (min 12 chars)}
+    volumes:
+      - nifi-state:/opt/nifi/nifi-current/state
+      - nifi-flowfile:/opt/nifi/nifi-current/flowfile_repository
+      - nifi-content:/opt/nifi/nifi-current/content_repository
+      - ./nifi/dead-letter:/opt/nifi/dead-letter
+      # PostgreSQL JDBC driver for PutDatabaseRecord's DBCPConnectionPool controller
+      # service — not bundled in the stock NiFi image (see ARCHITECTURE.md §2.A step 4).
+      - ./drivers:/opt/nifi/nifi-current/drivers:ro
+    restart: unless-stopped
+
+volumes:
+  nifi-state:
+  nifi-flowfile:
+  nifi-content:

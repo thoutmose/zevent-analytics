@@ -1,0 +1,113 @@
+version: 1
+disable_existing_loggers: no
+
+formatters:
+  standard:
+    format: "%(asctime)s | %(levelname)s - %(name)s - %(message)s"
+
+  error:
+    format: "%(asctime)s | %(levelname)s - %(name)s <PID %(process)d:%(processName)s> %(name)s.%(funcName)s(): %(message)s"
+
+  color:
+    "()": colorlog.ColoredFormatter
+    format: "%(asctime)s | %(log_color)s%(levelname)s%(reset)s - %(name)s - %(message)s"
+    log_colors:
+      DEBUG: cyan
+      INFO: green
+      WARNING: yellow
+      ERROR: red
+      CRITICAL: bold_red
+
+handlers:
+  info_file_handler:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: standard
+    filename: logging/info.log
+    maxBytes: 10485760 # 10MB
+    backupCount: 20
+    encoding: utf8
+
+  warn_file_handler:
+    class: logging.handlers.RotatingFileHandler
+    level: WARN
+    formatter: standard
+    filename: logging/warn.log
+    maxBytes: 10485760
+    backupCount: 20
+    encoding: utf8
+
+  error_file_handler:
+    class: logging.handlers.RotatingFileHandler
+    level: ERROR
+    formatter: error
+    filename: logging/errors.log
+    maxBytes: 10485760
+    backupCount: 20
+    encoding: utf8
+
+  critical_file_handler:
+    class: logging.handlers.RotatingFileHandler
+    level: CRITICAL
+    formatter: standard
+    filename: logging/critical.log
+    maxBytes: 10485760
+    backupCount: 20
+    encoding: utf8
+
+  debug_file_handler:
+    class: logging.handlers.RotatingFileHandler
+    level: DEBUG
+    formatter: standard
+    filename: logging/debug.log
+    maxBytes: 10485760
+    backupCount: 20
+    encoding: utf8
+
+  root_file_handler:
+    class: logging.handlers.RotatingFileHandler
+    level: DEBUG
+    formatter: standard
+    filename: logging/logs.log
+    maxBytes: 10485760
+    backupCount: 20
+    encoding: utf8
+
+  console:
+    class: logging.StreamHandler
+    level: DEBUG
+    formatter: color
+    stream: ext://sys.stdout
+
+  error_console:
+    class: logging.StreamHandler
+    level: ERROR
+    formatter: error
+    stream: ext://sys.stderr
+
+# root is intentionally left without handlers here — logging_setup.setup_logging()
+# fills root.handlers/root.level from the matching profile below (selected via
+# APP_ENV) before calling dictConfig. Every logger in this project (zevent_extractor,
+# nifi_client, zevent_api, twitchio.*) propagates up to root by default, so this is
+# what actually determines where their output goes.
+root:
+  level: NOTSET
+  handlers: []
+  propagate: yes
+
+loggers:
+  development:
+    level: DEBUG
+    handlers:
+      - console
+      - info_file_handler
+      - error_file_handler
+      - critical_file_handler
+      - debug_file_handler
+      - warn_file_handler
+
+  production:
+    level: INFO
+    handlers:
+      - console
+      - info_file_handler
