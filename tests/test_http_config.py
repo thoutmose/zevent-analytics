@@ -7,7 +7,7 @@ import http_config
 
 def test_user_agent_default():
     _ = importlib.reload(http_config)
-    assert http_config.USER_AGENT.startswith("twitch-analytics/0.1")
+    assert http_config.USER_AGENT.startswith("zevent-analytics/0.1")
 
 
 def test_user_agent_env_override(monkeypatch: pytest.MonkeyPatch):
