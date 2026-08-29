@@ -354,6 +354,38 @@ cached in `.tio.tokens.json` so later runs don't need to re-authorize
 (as long as the process shuts down cleanly — see
 [`nifi_client.wait_for_pending_pushes`](nifi_client.py)).
 
+### Running as a service (start/stop)
+
+For a long-running event (Zevent runs ~55h), the three extractors run as
+systemd services on srv-dev rather than a foreground `uv run`. Dev and prod
+are two entirely separate checkouts (`twitch-analytics` and
+`twitch-analytics-prod`), each with its own `.env` — dev's `NIFI_WEBHOOK_URL`
+points at the local dev NiFi (`zevent-dev` database), prod's points at
+srv-prod's NiFi over Tailscale (`zevent` database). Each checkout has its own
+`.tio.tokens.json`, so each needs its own one-time Twitch device-code
+approval.
+
+```bash
+# Start (dev):
+sudo systemctl start zevent-api zevent-donation-goals zevent-main
+
+# Start (prod):
+sudo systemctl start zevent-api-prod zevent-donation-goals-prod zevent-main-prod
+
+# Stop — either environment, same pattern with/without the -prod suffix:
+sudo systemctl stop zevent-api zevent-donation-goals zevent-main
+
+# Status / follow logs for one service:
+sudo systemctl status zevent-main
+sudo journalctl -u zevent-main -f
+
+# Prevent a stopped service from coming back on the next reboot:
+sudo systemctl disable zevent-api-prod zevent-donation-goals-prod zevent-main-prod
+```
+
+All six are `Restart=on-failure` — a crash restarts automatically, a manual
+`stop` does not (until the next reboot, unless also `disable`d).
+
 ## Configuration reference
 
 All variables live in `.env` (see [`.env.example`](.env.example) for the

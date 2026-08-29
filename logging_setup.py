@@ -7,14 +7,34 @@ twitchio.*, aiohttp) land in the same place: colored console output plus a set
 of rotating files under logging/ (info/warn/errors/critical/debug/logs.log).
 """
 
+import gzip
 import logging.config
+import logging.handlers
 import os
+import shutil
 from pathlib import Path
 
 import yaml
 
 CONFIG_PATH: Path = Path(__file__).parent / "logging.yaml"
 LOG_DIR: Path = Path(__file__).parent / "logging"
+
+
+class CompressedRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler that gzips each rotated-out file.
+
+    Long-running processes (the ~55h Zevent event) roll over many times;
+    plain RotatingFileHandler leaves every backup uncompressed. Referenced
+    from logging.yaml as logging_setup.CompressedRotatingFileHandler.
+    """
+
+    def rotation_filename(self, default_name: str) -> str:
+        return default_name + ".gz"
+
+    def rotate(self, source: str, dest: str) -> None:
+        with open(source, "rb") as f_in, gzip.open(dest, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+        os.remove(source)
 
 
 def setup_logging(env: str | None = None) -> None:
