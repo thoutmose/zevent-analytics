@@ -33,6 +33,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # srv-prod is only reachable over Tailscale (SRV_PROD_HOST is its
+      # tailnet IP), not the public internet — the hosted runner needs to
+      # join the tailnet before any SSH step can reach it. TAILSCALE_AUTHKEY
+      # should be an ephemeral, expiring auth key (Tailscale admin console ->
+      # Settings -> Keys), not a permanent one.
+      - name: Join Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
       - name: Load deploy key
         uses: webfactory/ssh-agent@v0.9.0
         with:
