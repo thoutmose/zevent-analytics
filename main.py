@@ -35,9 +35,11 @@ import os
 import random
 import re
 import signal
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, override
 
 import aiohttp
 import pyarrow as pa
@@ -50,37 +52,42 @@ import logging_setup
 import nifi_client
 import zevent_api
 
-load_dotenv()
+_ = load_dotenv()
 
-LOGGER = logging.getLogger("zevent_extractor")
+LOGGER: logging.Logger = logging.getLogger("zevent_extractor")
 
-CLIENT_ID = os.environ["TWITCH_CLIENT_ID"]
-METADATA_SNAPSHOT_INTERVAL_SECONDS = int(
+CLIENT_ID: str = os.environ["TWITCH_CLIENT_ID"]
+METADATA_SNAPSHOT_INTERVAL_SECONDS: int = int(
     os.environ.get("METADATA_SNAPSHOT_INTERVAL_SECONDS", "15")
 )
 
 # Twitch caps both "get streams" and "get users" at 100 login/id values per call.
-HELIX_BATCH_SIZE = 100
+HELIX_BATCH_SIZE: int = 100
 # How many channels one anonymous IRC connection joins. Sharding across several
 # connections bounds the blast radius of a single dropped connection and keeps
 # each connection's JOIN burst short.
-CHANNELS_PER_IRC_CONNECTION = int(os.environ.get("CHANNELS_PER_IRC_CONNECTION", "50"))
+CHANNELS_PER_IRC_CONNECTION: int = int(
+    os.environ.get("CHANNELS_PER_IRC_CONNECTION", "50")
+)
 # Twitch rate-limits unverified connections to ~20 JOIN/PART per 10s.
-IRC_JOIN_PACING_SECONDS = float(os.environ.get("IRC_JOIN_PACING_SECONDS", "0.5"))
+IRC_JOIN_PACING_SECONDS: float = float(os.environ.get("IRC_JOIN_PACING_SECONDS", "0.5"))
 
-IRC_WS_URL = "wss://irc-ws.chat.twitch.tv:443"
-PRIVMSG_RE = re.compile(
-    r"^(?:@(?P<tags>\S+) )?:(?P<nick>[^!]+)!\S+ PRIVMSG #(?P<channel>\S+) :(?P<text>.*)$"
+IRC_WS_URL: str = "wss://irc-ws.chat.twitch.tv:443"
+PRIVMSG_RE: re.Pattern[str] = re.compile(
+    r"^(?:@(?P<tags>\S+) )?:(?P<nick>[^!]+)!\S+ PRIVMSG #(?P<channel>\S+) "
+    r":(?P<text>.*)$"
 )
 
-PARQUET_OUTPUT_DIR = Path(os.environ.get("PARQUET_OUTPUT_DIR", "data"))
-CHAT_DIR = PARQUET_OUTPUT_DIR / "live_chat"
-METADATA_DIR = PARQUET_OUTPUT_DIR / "metadata"
-MAX_ROWS_PER_PARQUET_FILE = int(os.environ.get("MAX_ROWS_PER_PARQUET_FILE", "100000"))
-FLUSH_INTERVAL_SECONDS = int(os.environ.get("FLUSH_INTERVAL_SECONDS", "30"))
-PARQUET_COMPRESSION = os.environ.get("PARQUET_COMPRESSION", "zstd")
+PARQUET_OUTPUT_DIR: Path = Path(os.environ.get("PARQUET_OUTPUT_DIR", "data"))
+CHAT_DIR: Path = PARQUET_OUTPUT_DIR / "live_chat"
+METADATA_DIR: Path = PARQUET_OUTPUT_DIR / "metadata"
+MAX_ROWS_PER_PARQUET_FILE: int = int(
+    os.environ.get("MAX_ROWS_PER_PARQUET_FILE", "100000")
+)
+FLUSH_INTERVAL_SECONDS: int = int(os.environ.get("FLUSH_INTERVAL_SECONDS", "30"))
+PARQUET_COMPRESSION: str = os.environ.get("PARQUET_COMPRESSION", "zstd")
 
-SCOPES = twitchio.Scopes()
+SCOPES: twitchio.Scopes = twitchio.Scopes()
 
 
 def _chunked(items: list[str], size: int) -> list[list[str]]:
@@ -98,14 +105,14 @@ class BatchParquetWriter:
     def __init__(
         self, directory: Path, suffix: str, max_rows: int = MAX_ROWS_PER_PARQUET_FILE
     ) -> None:
-        self.directory = directory
-        self.suffix = suffix
-        self.max_rows = max_rows
-        self.part = 1
-        self.rows: list[dict] = []
-        self.batch_started_at = datetime.now(timezone.utc)
+        self.directory: Path = directory
+        self.suffix: str = suffix
+        self.max_rows: int = max_rows
+        self.part: int = 1
+        self.rows: list[dict[str, Any]] = []
+        self.batch_started_at: datetime = datetime.now(UTC)
 
-    def add(self, row: dict) -> None:
+    def add(self, row: dict[str, Any]) -> None:
         """Buffers one row, flushing immediately if max_rows is reached."""
         self.rows.append(row)
         if len(self.rows) >= self.max_rows:
@@ -137,7 +144,7 @@ class BatchParquetWriter:
         nifi_client.push_batch_background("main.py", self.suffix, rows)
         self.rows = []
         self.part += 1
-        self.batch_started_at = datetime.now(timezone.utc)
+        self.batch_started_at = datetime.now(UTC)
 
 
 @dataclass
@@ -164,27 +171,37 @@ class ChatConnection:
     """
 
     def __init__(self, channels: list[str], bot: "ZeventBot") -> None:
-        self.channels = channels
-        self.bot = bot
+        self.channels: list[str] = channels
+        self.bot: ZeventBot = bot
 
     async def run(self) -> None:
-        """Connects, and reconnects with exponential backoff (capped at 60s) on drop."""
+        """Connects, and reconnects with jittered exponential backoff (capped
+        at 60s) on drop.
+
+        The jitter (sleep somewhere in [backoff, 2*backoff], capped at 60s,
+        instead of exactly backoff) matters at this shard count: a shared
+        outage would otherwise have every one of the ~7 shards reconnect in
+        lockstep and hit Twitch at the same instant.
+        """
         backoff = 5
         while True:
             try:
                 await self._connect_once()
-                backoff = 5  # a clean iteration (should only end via cancellation) resets backoff
+                # a clean iteration (should only end via cancellation) resets backoff
+                backoff = 5
             except (aiohttp.ClientError, ConnectionResetError, asyncio.TimeoutError):
+                sleep_seconds = min(backoff + random.uniform(0, backoff), 60)
                 LOGGER.exception(
-                    "IRC connection dropped (%d channels), reconnecting in %ds",
+                    "IRC connection dropped (%d channels), reconnecting in %.1fs",
                     len(self.channels),
-                    backoff,
+                    sleep_seconds,
                 )
-                await asyncio.sleep(backoff)
+                await asyncio.sleep(sleep_seconds)
                 backoff = min(backoff * 2, 60)
 
     async def _connect_once(self) -> None:
-        """Opens one IRC websocket, joins every channel in this shard, and reads chat forever."""
+        """Opens one IRC websocket, joins every channel in this shard, and
+        reads chat forever."""
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(IRC_WS_URL) as ws:
                 await ws.send_str("CAP REQ :twitch.tv/tags")
@@ -223,17 +240,33 @@ class ChatConnection:
 
 
 class ZeventBot(commands.Bot):
-    """Watches every channel in `channels`: chat via sharded IRC, metadata via batched Helix polls."""
+    """Watches every channel in `channels`: chat via sharded IRC, metadata via
+    batched Helix polls."""
 
     def __init__(self, channels: list[str]) -> None:
         super().__init__(client_id=CLIENT_ID, scopes=SCOPES, prefix="!")
-        self.channels = channels
+        self.channels: list[str] = channels
         self.stats: dict[str, ChannelStats] = {}
-        self.chat_writer = BatchParquetWriter(CHAT_DIR, "live_chat")
-        self.metadata_writer = BatchParquetWriter(METADATA_DIR, "metadata")
+        self.chat_writer: BatchParquetWriter = BatchParquetWriter(CHAT_DIR, "live_chat")
+        self.metadata_writer: BatchParquetWriter = BatchParquetWriter(
+            METADATA_DIR, "metadata"
+        )
+        # asyncio only holds a *weak* reference to a task returned by
+        # create_task() — an unreferenced one can be garbage-collected mid-run
+        # (see event_ready below). Keeping strong refs here, the same pattern
+        # nifi_client._pending_pushes uses, is what keeps chat/metadata
+        # collection from silently dying partway through the event.
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
+    def _spawn_background(self, coro: "Coroutine[Any, Any, None]") -> None:
+        """asyncio.create_task(), but keeps a strong reference until it completes."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def event_ready(self) -> None:
-        """Resolves broadcaster IDs, takes an initial poll, then starts all background loops."""
+        """Resolves broadcaster IDs, takes an initial poll, then starts all
+        background loops."""
         LOGGER.info("Authorized as user id: %s", self.bot_id)
         CHAT_DIR.mkdir(parents=True, exist_ok=True)
         METADATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -262,10 +295,10 @@ class ZeventBot(commands.Bot):
             for shard in _chunked(self.channels, CHANNELS_PER_IRC_CONNECTION)
         ]
         for conn in connections:
-            asyncio.create_task(conn.run())
+            self._spawn_background(conn.run())
 
-        asyncio.create_task(self._metadata_snapshot_loop())
-        asyncio.create_task(self._flush_loop())
+        self._spawn_background(self._metadata_snapshot_loop())
+        self._spawn_background(self._flush_loop())
         LOGGER.info(
             "Watching %d channels across %d IRC connection(s)",
             len(self.channels),
@@ -273,7 +306,8 @@ class ZeventBot(commands.Bot):
         )
 
     async def _flush_loop(self) -> None:
-        """Periodically flushes buffered rows so data lands on disk/NiFi continuously."""
+        """Periodically flushes buffered rows so data lands on disk/NiFi
+        continuously."""
         while True:
             await asyncio.sleep(FLUSH_INTERVAL_SECONDS)
             self.chat_writer.flush()
@@ -287,7 +321,8 @@ class ZeventBot(commands.Bot):
         sent_ts_ms: str | None,
         text: str,
     ) -> None:
-        """Records one chat message against its channel's stats and buffers it for writing.
+        """Records one chat message against its channel's stats and buffers
+        it for writing.
 
         Silently ignores messages from a channel we didn't resolve at startup
         (shouldn't happen — IRC only receives messages for channels we joined).
@@ -297,9 +332,9 @@ class ZeventBot(commands.Bot):
             LOGGER.debug("Ignoring chat message from unknown channel %r", channel)
             return
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         message_sent_at = (
-            datetime.fromtimestamp(int(sent_ts_ms) / 1000, tz=timezone.utc)
+            datetime.fromtimestamp(int(sent_ts_ms) / 1000, tz=UTC)
             if sent_ts_ms
             else now
         )
@@ -314,7 +349,7 @@ class ZeventBot(commands.Bot):
                 "channel": stats.channel,
                 "chatter": chatter,
                 "chatter_id": chatter_id,
-                "text": text,
+                "message_text": text,
                 "message_sent_at": message_sent_at,
                 "captured_at": now,
             }
@@ -325,7 +360,7 @@ class ZeventBot(commands.Bot):
         snapshot row per channel. Doubles as both the parquet/NiFi write and the
         source of the aggregate log line below — no separate polling loop.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         live_by_login: dict[str, twitchio.Stream] = {}
         for chunk in _chunked(self.channels, HELIX_BATCH_SIZE):
             logins: list[int | str] = list(chunk)
@@ -374,13 +409,16 @@ class ZeventBot(commands.Bot):
         )
 
     async def _metadata_snapshot_loop(self) -> None:
-        """Runs _poll_all_streams() every METADATA_SNAPSHOT_INTERVAL_SECONDS, forever."""
+        """Runs _poll_all_streams() every METADATA_SNAPSHOT_INTERVAL_SECONDS,
+        forever."""
         while True:
             await asyncio.sleep(METADATA_SNAPSHOT_INTERVAL_SECONDS)
             await self._poll_all_streams()
 
+    @override
     async def close(self, **options: object) -> None:
-        """Flushes buffered rows, waits for any in-flight NiFi push, then closes the bot."""
+        """Flushes buffered rows, waits for any in-flight NiFi push, then
+        closes the bot."""
         self.chat_writer.flush()
         self.metadata_writer.flush()
         await nifi_client.wait_for_pending_pushes()
@@ -388,16 +426,18 @@ class ZeventBot(commands.Bot):
 
 
 async def _fetch_roster() -> list[str]:
-    """Fetches the current Zevent streamer roster (Twitch logins) from zevent.fr/api/."""
+    """Fetches the current Zevent streamer roster (Twitch logins) from
+    zevent.fr/api/."""
     async with aiohttp.ClientSession() as session:
         snapshot = await zevent_api.fetch_snapshot(session)
     return [s.twitch_login for s in snapshot.streamers]
 
 
 def main() -> None:
-    """Entry point: fetches the roster, authorizes via Device Code Flow, then runs forever."""
+    """Entry point: fetches the roster, authorizes via Device Code Flow, then
+    runs forever."""
     logging_setup.setup_logging()
-    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    _ = signal.signal(signal.SIGTERM, signal.default_int_handler)
 
     async def runner() -> None:
         channels = await _fetch_roster()

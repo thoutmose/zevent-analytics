@@ -2,6 +2,9 @@
 -- Applied on srv-db (PostgreSQL). NiFi's PutDatabaseRecord processors write here through
 -- PgBouncer. Each row carries the batch_id/row_number pair its source batch was tagged
 -- with (see nifi_client.py), so a replayed flowfile is a no-op instead of a duplicate.
+--
+-- Run statement-by-statement (e.g. `psql -f`, not wrapped in one BEGIN/COMMIT): the
+-- CREATE INDEX CONCURRENTLY statements below can't execute inside a transaction block.
 
 CREATE TABLE IF NOT EXISTS bronze_live_chat (
     id              BIGSERIAL PRIMARY KEY,
@@ -10,7 +13,7 @@ CREATE TABLE IF NOT EXISTS bronze_live_chat (
     channel         TEXT NOT NULL,
     chatter         TEXT,
     chatter_id      TEXT,
-    text            TEXT,
+    message_text    TEXT,
     message_sent_at TIMESTAMPTZ,
     captured_at     TIMESTAMPTZ,
     ingested_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -46,6 +49,6 @@ CREATE TABLE IF NOT EXISTS bronze_zevent_snapshots (
     UNIQUE (batch_id, row_number)
 );
 
-CREATE INDEX IF NOT EXISTS bronze_live_chat_captured_at_idx ON bronze_live_chat (captured_at);
-CREATE INDEX IF NOT EXISTS bronze_metadata_snapshots_snapshot_at_idx ON bronze_metadata_snapshots (snapshot_at);
-CREATE INDEX IF NOT EXISTS bronze_zevent_snapshots_ingested_at_idx ON bronze_zevent_snapshots (ingested_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS bronze_live_chat_captured_at_idx ON bronze_live_chat (captured_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS bronze_metadata_snapshots_snapshot_at_idx ON bronze_metadata_snapshots (snapshot_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS bronze_zevent_snapshots_ingested_at_idx ON bronze_zevent_snapshots (ingested_at);

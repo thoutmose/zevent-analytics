@@ -13,8 +13,8 @@ from pathlib import Path
 
 import yaml
 
-CONFIG_PATH = Path(__file__).parent / "logging.yaml"
-LOG_DIR = Path(__file__).parent / "logging"
+CONFIG_PATH: Path = Path(__file__).parent / "logging.yaml"
+LOG_DIR: Path = Path(__file__).parent / "logging"
 
 
 def setup_logging(env: str | None = None) -> None:

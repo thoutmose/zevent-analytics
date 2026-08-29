@@ -12,3 +12,38 @@ dependencies = [
     "colorlog>=6.12.0",
     "pyyaml>=6.0.3",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff==0.15.22",
+    "ty==0.0.63",
+    "sqlfluff==4.2.2",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "bandit>=1.8",
+    "pip-audit>=2.7",
+]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+extend-select = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.sqlfluff.core]
+dialect = "postgres"
+# LT01/LT05: the schema's column-aligned style (matching this repo's dataclass
+# field style) is intentional, not a lint gap.
+exclude_rules = ["LT01", "LT05"]
+
+[tool.bandit]
+exclude_dirs = [".venv", "tests"]
+# B311: random.uniform/randint here are reconnect jitter and an anonymous IRC
+# nick suffix, not security-sensitive — not a candidate for secrets.SystemRandom.
+skips = ["B311"]

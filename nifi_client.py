@@ -1,11 +1,13 @@
-"""Optional push of extraction batches to the NiFi ingestion webhook (see ARCHITECTURE.md).
+"""Optional push of extraction batches to the NiFi ingestion webhook (see
+ARCHITECTURE.md).
 
-Set NIFI_WEBHOOK_URL to enable. Left unset, main.py and zevent_api.py behave exactly as
-before (parquet-only / stdout-only) — this module is an additive sink, not a replacement.
+Set NIFI_WEBHOOK_URL to enable. Left unset, main.py and zevent_api.py behave
+exactly as before (parquet-only / stdout-only) — this module is an additive
+sink, not a replacement.
 
-Each batch carries a batch_id (UUID) and a row_number per row, so the NiFi flow can use
-`INSERT ... ON CONFLICT (batch_id, row_number) DO NOTHING` downstream and stay safe to
-replay after a crash or a dead-letter retry.
+Each batch carries a batch_id (UUID) and a row_number per row, so the NiFi
+flow can use `INSERT ... ON CONFLICT (batch_id, row_number) DO NOTHING`
+downstream and stay safe to replay after a crash or a dead-letter retry.
 """
 
 import asyncio
@@ -13,17 +15,20 @@ import json
 import logging
 import os
 import uuid
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
+from typing import Any
 
 import aiohttp
 from dotenv import load_dotenv
 
-load_dotenv()
+_ = load_dotenv()
 
-LOGGER = logging.getLogger("nifi_client")
+LOGGER: logging.Logger = logging.getLogger("nifi_client")
 
-NIFI_WEBHOOK_URL = os.environ.get("NIFI_WEBHOOK_URL")
-NIFI_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("NIFI_REQUEST_TIMEOUT_SECONDS", "10"))
+NIFI_WEBHOOK_URL: str | None = os.environ.get("NIFI_WEBHOOK_URL")
+NIFI_REQUEST_TIMEOUT_SECONDS: int = int(
+    os.environ.get("NIFI_REQUEST_TIMEOUT_SECONDS", "10")
+)
 
 # Tracks in-flight push_batch() background tasks (see push_batch_background), so a
 # graceful shutdown can await them via wait_for_pending_pushes() instead of cancelling
@@ -53,7 +58,7 @@ def _json_default(value: object) -> str:
     return str(value)
 
 
-async def push_batch(source: str, stream: str, rows: list[dict]) -> None:
+async def push_batch(source: str, stream: str, rows: list[dict[str, Any]]) -> None:
     """POSTs one batch to NIFI_WEBHOOK_URL (a NiFi ListenHTTP processor).
 
     No-op if NIFI_WEBHOOK_URL is unset or rows is empty. Prefer
@@ -68,7 +73,7 @@ async def push_batch(source: str, stream: str, rows: list[dict]) -> None:
         "source": source,
         "stream": stream,
         "batch_id": batch_id,
-        "batched_at": datetime.now(timezone.utc).isoformat(),
+        "batched_at": datetime.now(UTC).isoformat(),
         # batch_id is duplicated onto every row (not just the envelope) because the
         # NiFi flow splits "rows" into one flowfile per row before PutDatabaseRecord,
         # and needs batch_id present on each one for the UNIQUE (batch_id, row_number)
@@ -108,7 +113,8 @@ async def push_batch(source: str, stream: str, rows: list[dict]) -> None:
         # have already reached NiFi even though we didn't see the response in time.
         # Don't auto-retry on this exception — a blind retry can double-insert.
         LOGGER.exception(
-            "[nifi] push %s/%s batch_id=%s (%d rows) to %s did not confirm — it may or may not have landed",
+            "[nifi] push %s/%s batch_id=%s (%d rows) to %s did not confirm — "
+            "it may or may not have landed",
             source,
             stream,
             batch_id,
@@ -117,7 +123,7 @@ async def push_batch(source: str, stream: str, rows: list[dict]) -> None:
         )
 
 
-def push_batch_background(source: str, stream: str, rows: list[dict]) -> None:
+def push_batch_background(source: str, stream: str, rows: list[dict[str, Any]]) -> None:
     """Fires push_batch() as a tracked background task (fire-and-forget for the
     caller, but visible to wait_for_pending_pushes() for a graceful shutdown)."""
     if not NIFI_WEBHOOK_URL or not rows:
@@ -142,7 +148,8 @@ async def wait_for_pending_pushes(timeout: float = 30.0) -> None:
     _, still_pending = await asyncio.wait(pending, timeout=timeout)
     if still_pending:
         LOGGER.warning(
-            "[nifi] %d push(es) still in flight after %.0fs, letting shutdown proceed anyway",
+            "[nifi] %d push(es) still in flight after %.0fs, letting "
+            "shutdown proceed anyway",
             len(still_pending),
             timeout,
         )

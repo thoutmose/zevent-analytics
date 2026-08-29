@@ -11,6 +11,7 @@
 ![Docker Compose](https://img.shields.io/badge/Docker%20Compose-NiFi%20stack-2496ED?logo=docker&logoColor=white)
 ![Ruff](https://img.shields.io/badge/lint%20%2F%20format-Ruff-D7FF64?logo=ruff&logoColor=black)
 ![ty](https://img.shields.io/badge/type%20check-ty-FCA121)
+[![CI](https://github.com/thoutmose/twitch-analytics/actions/workflows/ci.yml/badge.svg)](https://github.com/thoutmose/twitch-analytics/actions/workflows/ci.yml)
 
 Extracts live-stream data for every Twitch channel participating in
 [Zevent](https://zevent.fr/) — chat, viewer counts, stream metadata, and the
@@ -42,19 +43,21 @@ of everything along the way.
 
 ## Overview
 
-Two independent extractors feed the same pipeline:
+Three independent extractors feed the same pipeline:
 
 | Script | Watches | Source | Auth |
 |---|---|---|---|
 | [`main.py`](main.py) | Every channel in the current Zevent roster (300+) | Twitch Helix (batched polling) + anonymous IRC (sharded connections) | Device Code Flow, app-only |
 | [`zevent_api.py`](zevent_api.py) | The whole event at once | [`zevent.fr/api/`](https://zevent.fr/api/), public/unauthenticated | none |
+| [`zevent_donation_goals.py`](zevent_donation_goals.py) | Every streamer's donation goals | `api.ppr.evenmorestats.fr` (the JSON backend behind [`zevent.gdoc.fr/participations`](https://zevent.gdoc.fr/participations), public/unauthenticated) | none |
 
-Both push their batches to an [Apache NiFi](https://nifi.apache.org/) flow
-over HTTP (`NIFI_WEBHOOK_URL`) which routes, splits, and writes them into
-PostgreSQL — see [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design
-rationale (batching, backpressure, idempotency, dead-lettering). Left
-unset, both scripts still run standalone and land Parquet files locally —
-NiFi is an additive sink, not a hard dependency.
+All three push their batches to an [Apache NiFi](https://nifi.apache.org/)
+flow over HTTP (`NIFI_WEBHOOK_URL`) which routes, splits, and writes them
+into PostgreSQL — see [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full
+design rationale (batching, backpressure, idempotency, dead-lettering). Left
+unset, all three scripts still run standalone — `main.py` lands Parquet
+files locally, the other two still write their local checkpoint — NiFi is
+an additive sink, not a hard dependency.
 
 `main.py` no longer targets a single hardcoded channel: it fetches the
 current Zevent streamer list from `zevent.fr/api/` at startup and watches
@@ -71,11 +74,13 @@ flowchart LR
     subgraph Sources
         TW["Twitch<br/>(Helix + anonymous IRC)"]
         ZV["zevent.fr/api/"]
+        DGAPI["api.ppr.evenmorestats.fr<br/>(zevent.gdoc.fr's backend)"]
     end
 
     subgraph "Python extractors"
         MAIN["main.py<br/>(sharded IRC + batched Helix poll)"]
         ZAPI["zevent_api.py<br/>(event-wide snapshot)"]
+        DGOAL["zevent_donation_goals.py<br/>(per-streamer goal list)"]
     end
 
     subgraph "Local landing zone"
@@ -88,7 +93,8 @@ flowchart LR
         MERGE["MergeContent<br/>(correlate by stream)"]
         ROUTE["RouteOnAttribute"]
         SPLIT["SplitJson<br/>(rows → 1 flowfile each)"]
-        PUTDB["PutDatabaseRecord"]
+        PUTDB["PutDatabaseRecord<br/>(INSERT, bronze_live_chat/<br/>metadata_snapshots/zevent_snapshots)"]
+        PUTDBUP["PutDatabaseRecord<br/>(UPSERT, bronze_donation_goals)"]
         DEADLETTER[("PutFile<br/>dead-letter")]
     end
 
@@ -100,14 +106,21 @@ flowchart LR
     TW --> MAIN
     ZV --> ZAPI
     ZV -.roster at startup.-> MAIN
+    DGAPI --> DGOAL
     MAIN --> PARQUET
     MAIN -- NIFI_WEBHOOK_URL --> LISTEN
     ZAPI -- NIFI_WEBHOOK_URL --> LISTEN
-    LISTEN --> EJP --> MERGE --> ROUTE --> SPLIT --> PUTDB
+    DGOAL -- NIFI_WEBHOOK_URL --> LISTEN
+    LISTEN --> EJP --> MERGE --> ROUTE --> SPLIT
+    SPLIT -- stream != donation_goals --> PUTDB
+    SPLIT -- stream == donation_goals --> PUTDBUP
     PUTDB -- success --> PG
     PUTDB -- failure --> DEADLETTER
+    PUTDBUP -- success --> PG
+    PUTDBUP -- failure --> DEADLETTER
     PGB --> PG
     PUTDB -.via PgBouncer.-> PGB
+    PUTDBUP -.via PgBouncer.-> PGB
 ```
 
 `srv-prod` runs NiFi only; PostgreSQL and PgBouncer run on a separate
@@ -148,13 +161,48 @@ bronze/raw landing layer, not a warehouse.
 — `nifi_client.py`'s own docstring calls it "an additive sink, not a
 replacement". Keeping the Parquet write means the extraction survives
 NiFi being down, misconfigured, or not deployed yet, and gives a
-zstd-compressed local copy to re-derive from independent of the DB. The
-trade-off is the two sinks can disagree if one push fails and the other
-doesn't (see [Known limitations](#known-limitations)) — acceptable for a
-bronze layer that's meant to be replayed, not treated as a single source
-of truth.
+zstd-compressed local copy to re-derive from independent of the DB. It
+also acts as the buffer during a NiFi outage: at the ~190 msg/s peak
+estimated in [Reliability mechanisms](#reliability-mechanisms), even a
+30-minute outage is only ~340K messages of chat, comfortably absorbed as
+local Parquet. The trade-off is the two sinks can disagree if one push
+fails and the other doesn't (see [Known limitations](#known-limitations))
+— acceptable for a bronze layer that's meant to be replayed, not treated
+as a single source of truth.
+
+### Why `zevent_donation_goals.py` calls a JSON API instead of scraping HTML
+
+`zevent.gdoc.fr/participations` is a client-rendered Nuxt SPA — its HTML
+response carries no data at all, only a JS bundle that fetches everything
+from `api.ppr.evenmorestats.fr` after the page loads. Scraping the rendered
+page would mean running a headless browser just to read back JSON the page
+itself already fetched over plain HTTP; calling that backend directly
+(`/events`, `/events/{id}/donation_goals/overview`,
+`/participations/{id}/donation_goals` — reverse-engineered from the SPA's JS
+bundle) is lighter, faster, and exactly the same approach `zevent_api.py`
+already takes against `zevent.fr/api/` instead of scraping `zevent.fr`.
+
+Each goal also carries an `accomplished` flag (whether it's been met) —
+dropped on purpose. This module tracks what the goals *are*, not how close
+to met they are; `bronze_zevent_snapshots.total_donation_amount_eur`
+(`zevent_api.py`) already covers overall progress.
+
+Unlike the two append-only extractors above, this table is meant to reflect
+only the *current* set of goals, not a history of every poll — see
+`sql/002_donation_goals.sql` and [Data model](#data-model) for how that's
+implemented (UPSERT, not INSERT) and its one known gap (removed goals aren't
+deleted).
 
 ## Reliability mechanisms
+
+Sized against Zevent 2025 — the same format Zevent 2026 follows: 327
+channels, 55h of live, 751,889 peak viewers, 296,175 average viewers. At
+Twitch's rough 1–3 chat messages/min per 100 viewers (the ratio drops as a
+channel gets bigger — chat scrolls too fast to read, and slow-mode often
+throttles the biggest ones further), that puts extraction/load at roughly
+**74 msg/s sustained, ~190 msg/s at peak**, and the peak itself is a ramp
+over tens of minutes (day/night viewer cycle) rather than a sudden spike —
+there's no wall of traffic arriving in seconds to design around.
 
 What's actually implemented and testable in this repo, as of the latest
 multi-channel rewrite:
@@ -171,10 +219,20 @@ multi-channel rewrite:
   before the event loop closes, so a NiFi push isn't cancelled mid-request
   (a cancelled-but-already-sent request is ambiguous — see that
   function's docstring for the double-insert this prevents).
-- **IRC sharded across reconnecting connections** — each
+- **IRC sharded across reconnecting connections, with jitter** — each
   [`ChatConnection`](main.py) covers `CHANNELS_PER_IRC_CONNECTION`
-  channels and reconnects with exponential backoff on drop, so one flaky
-  connection only affects its own shard, not the whole roster.
+  channels and reconnects with jittered exponential backoff on drop (sleep
+  somewhere in `[backoff, 2*backoff]`, capped at 60s, not exactly
+  `backoff`), so one flaky connection only affects its own shard, and a
+  shared outage across shards doesn't send every one of them back to
+  Twitch in lockstep.
+- **Zevent API checkpoint** — [`zevent_api.py`](zevent_api.py) has no
+  Parquet dual-write, so `_write_checkpoint` persists the last
+  successfully fetched snapshot to `ZEVENT_CHECKPOINT_PATH` (default
+  `data/zevent_checkpoint.json`) after every poll, via a temp-file-plus-
+  rename so a crash mid-write can't corrupt it. A restart, or a
+  zevent.fr/api/ outage (it happened for ~17min during Zevent 2024),
+  always leaves a recent known-good snapshot on disk.
 - **Rate-limit-aware fan-out** — Helix calls (`Get Users`/`Get Streams`)
   are chunked to 100 logins per request (Twitch's own limit); IRC `JOIN`s
   are paced (`IRC_JOIN_PACING_SECONDS`) to stay under Twitch's per-10s
@@ -200,16 +258,20 @@ restart was needed over the event's full duration.
 .
 ├── main.py                  # multi-channel Twitch extractor (chat + metadata)
 ├── zevent_api.py             # zevent.fr/api/ poller (event-wide snapshot)
+├── zevent_donation_goals.py   # per-streamer donation goal poller
 ├── nifi_client.py             # shared HTTP push helper (batching, retries-safe)
 ├── logging_setup.py           # loads logging.yaml, picks dev/prod handler profile
 ├── logging.yaml                # rotating file handlers + colored console
 ├── sql/001_bronze_schema.sql    # PostgreSQL bronze tables (applied on srv-db)
-├── docker-compose.yml            # local NiFi stack (srv-prod only)
-├── nifi/dead-letter/               # PutDatabaseRecord failures land here
-├── drivers/                          # PostgreSQL JDBC driver, mounted into NiFi
-├── openapi.yaml                        # every external Twitch API call, documented
-├── ARCHITECTURE.md                       # target production pipeline, in depth
-└── data/                                   # local Parquet output (gitignored)
+├── sql/002_donation_goals.sql    # bronze_donation_goals (latest-state, UPSERT)
+├── docker-compose.yml              # local NiFi stack (srv-prod only)
+├── nifi/dead-letter/                 # PutDatabaseRecord failures land here
+├── drivers/                            # PostgreSQL JDBC driver, mounted into NiFi
+├── openapi.yaml                          # every external Twitch API call, documented
+├── ARCHITECTURE.md                         # target production pipeline, in depth
+├── DEPLOYMENT.md                             # CD setup: secrets, srv-prod access
+├── .github/workflows/                          # CI (lint/test/security) + CD (srv-prod)
+└── data/                                         # local Parquet output (gitignored)
 ```
 
 ## Getting started
@@ -253,6 +315,7 @@ for why). The data-ingestion port (`ListenHTTP`) is `localhost:8888`.
 
 ```bash
 psql "postgresql://<user>@<srv-db-host>:5432/zevent" -f sql/001_bronze_schema.sql
+psql "postgresql://<user>@<srv-db-host>:5432/zevent" -f sql/002_donation_goals.sql
 ```
 
 ### 5. Build the NiFi flow
@@ -263,15 +326,20 @@ the [Architecture](#architecture) diagram above — `ListenHTTP` →
 `EvaluateJsonPath` → `MergeContent` → `RouteOnAttribute` → `SplitJson` →
 `PutDatabaseRecord` (+ dead-letter `PutFile` on failure). Full processor
 configuration is in [`ARCHITECTURE.md`](ARCHITECTURE.md#2-how-the-pieces-in-this-repo-map-onto-the-diagram).
+The `donation_goals` stream needs its own `PutDatabaseRecord` branch (routed
+by `RouteOnAttribute` on `stream == "donation_goals"`) configured with
+**Statement Type: UPSERT** and **Update Keys: participation_id, goal_id** —
+every other stream uses plain `INSERT` — see `sql/002_donation_goals.sql`.
 
 ### 6. Run the extractors
 
 ```bash
-uv run main.py         # every Zevent channel: chat + metadata
-uv run zevent_api.py   # event-wide snapshot (donations, viewer counts)
+uv run main.py                    # every Zevent channel: chat + metadata
+uv run zevent_api.py              # event-wide snapshot (donations, viewer counts)
+uv run zevent_donation_goals.py   # every streamer's donation goal list
 ```
 
-Each is independent — run one, the other, or both. On first run, `main.py`
+Each is independent — run any subset of them. On first run, `main.py`
 prints a Device Code Flow URL: open it, log in, authorize. The token is
 cached in `.tio.tokens.json` so later runs don't need to re-authorize
 (as long as the process shuts down cleanly — see
@@ -296,26 +364,41 @@ authoritative, commented list). Highlights:
 | `NIFI_WEBHOOK_URL` | *(unset)* | NiFi `ListenHTTP` endpoint; unset = Parquet/stdout only |
 | `APP_ENV` | `development` | Logging profile — see [Logging](#logging) |
 | `NIFI_ADMIN_USERNAME` / `NIFI_ADMIN_PASSWORD` | — | NiFi UI single-user login (docker-compose) |
+| `DONATION_GOALS_POLL_INTERVAL_SECONDS` | `300` | `zevent_donation_goals.py` poll interval |
+| `DONATION_GOALS_MAX_CONCURRENCY` | `5` | Max concurrent per-streamer goal-detail requests |
 
 ## Data model
 
-Three bronze tables in PostgreSQL (`sql/001_bronze_schema.sql`), one per
-`stream` value pushed through NiFi. Every row carries `batch_id` +
-`row_number`; `UNIQUE (batch_id, row_number)` makes a replayed batch a
-no-op instead of a duplicate.
+Four tables in PostgreSQL, one per `stream` value pushed through NiFi.
+
+`bronze_live_chat`, `bronze_metadata_snapshots`, and
+`bronze_zevent_snapshots` (`sql/001_bronze_schema.sql`) are append-only:
+every row carries `batch_id` + `row_number`, and `UNIQUE (batch_id,
+row_number)` makes a replayed batch a no-op instead of a duplicate.
 
 | Table | Fed by | Notable columns |
 |---|---|---|
-| `bronze_live_chat` | `main.py` (IRC) | `channel`, `chatter`, `chatter_id`, `text`, `message_sent_at`, `captured_at` |
+| `bronze_live_chat` | `main.py` (IRC) | `channel`, `chatter`, `chatter_id`, `message_text`, `message_sent_at`, `captured_at` |
 | `bronze_metadata_snapshots` | `main.py` (Helix poll) | `channel`, `is_live`, `title`, `category`, `viewer_count`, `duration_seconds`, `stream_started_at`, `snapshot_at` |
 | `bronze_zevent_snapshots` | `zevent_api.py` | `website_mode`, `total_donation_amount_eur`, `total_viewer_count`, `streamers` (`jsonb`: `twitch_id`, `twitch_login`, `display_name`, `profile_url`, `online`, `game`, `viewer_count`, `donation_amount_eur` per streamer) |
+
+`bronze_donation_goals` (`sql/002_donation_goals.sql`) is different: it
+holds only the *current* set of goals, not a history of every poll.
+`UNIQUE (participation_id, goal_id)` is the NiFi `PutDatabaseRecord` UPSERT
+key (see [step 5](#5-build-the-nifi-flow)), so a re-poll overwrites each
+goal's row in place.
+
+| Table | Fed by | Notable columns |
+|---|---|---|
+| `bronze_donation_goals` | `zevent_donation_goals.py` | `participation_id`, `streamer_name`, `twitch_login`, `twitch_id`, `goal_id`, `goal_name`, `goal_amount_eur`, `goal_category`, `snapshot_at` |
 
 ## Logging
 
 Configured centrally by [`logging_setup.py`](logging_setup.py) from
 [`logging.yaml`](logging.yaml) — every module logger (`zevent_extractor`,
-`nifi_client`, `zevent_api`, `twitchio.*`) propagates to the root logger,
-which is what actually determines where output goes.
+`nifi_client`, `zevent_api`, `zevent_donation_goals`, `twitchio.*`)
+propagates to the root logger, which is what actually determines where
+output goes.
 
 Two profiles, selected via `APP_ENV`:
 
@@ -329,12 +412,24 @@ Each file rotates at 10 MB, keeping 20 backups.
 ## Development
 
 ```bash
-uv run ruff format .   # formatting
-uv run ruff check .    # linting
-uv run ty check .      # static type checking
+uv sync --group dev     # ruff, ty, sqlfluff, pytest, bandit, pip-audit
+
+uv run ruff format .    # formatting
+uv run ruff check .     # linting
+uv run ty check .       # static type checking
+uv run sqlfluff lint sql/  # SQL lint
+uv run pytest            # unit tests (tests/)
+uv run bandit -c pyproject.toml -r .  # static security lint
+uv run pip-audit --strict             # dependency vulnerability scan
 ```
 
-All three are expected to pass clean on every file in this repo.
+All of the above are expected to pass clean on every file in this repo — CI
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the same
+checks, plus OpenAPI lint, `docker-compose.yml`/YAML validation, and secret
+scanning, on every push and pull request. CD
+([`.github/workflows/cd.yml`](.github/workflows/cd.yml)) deploys the NiFi
+stack to srv-prod after CI passes on `main`, gated by manual approval — see
+[`DEPLOYMENT.md`](DEPLOYMENT.md) for setup and how it works.
 
 ## Known limitations
 
@@ -355,3 +450,15 @@ All three are expected to pass clean on every file in this repo.
 - **No "viewer typology"** (lurker vs. chatter, new vs. returning) — Twitch
   doesn't expose a full viewer list, only active chatters, and only via a
   moderator-only endpoint.
+- **Removed donation goals aren't deleted.** `bronze_donation_goals` is kept
+  current via UPSERT, keyed on `(participation_id, goal_id)` — if a goal is
+  later pulled from `zevent.gdoc.fr` upstream, its row simply stops being
+  updated rather than being removed. Not expected to matter in practice
+  (goals are observed to only be added as the event approaches), but a
+  stale row would need a manual `DELETE`.
+- **`api.ppr.evenmorestats.fr` is undocumented and unofficial.** It's the
+  backend `zevent.gdoc.fr` (a third-party companion site, not run by Zevent
+  itself) happens to call — reverse-engineered from its JS bundle, not a
+  published/versioned API. It could change shape or move without notice;
+  `zevent_donation_goals.py` isn't insulated against that beyond normal
+  `aiohttp.ClientError` handling.

@@ -19,4 +19,9 @@ data/
 # Rotating log files (see logging.yaml / logging_setup.py)
 logging/
 
+# NiFi PutDatabaseRecord failures (docker-compose mounts this in) — production
+# dead-letter payloads, not something to track in git. See DEPLOYMENT.md.
+nifi/dead-letter/*
+!nifi/dead-letter/.gitkeep
+
 .claude/
