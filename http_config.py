@@ -16,5 +16,5 @@ _ = load_dotenv()
 
 USER_AGENT: str = os.environ.get(
     "HTTP_USER_AGENT",
-    "twitch-analytics/0.1 (https://github.com/thoutmose/twitch-analytics)",
+    "zevent-analytics/0.1 (https://github.com/thoutmose/zevent-analytics)",
 )
