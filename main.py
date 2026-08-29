@@ -413,7 +413,10 @@ class ZeventBot(commands.Bot):
         forever."""
         while True:
             await asyncio.sleep(METADATA_SNAPSHOT_INTERVAL_SECONDS)
-            await self._poll_all_streams()
+            try:
+                await self._poll_all_streams()
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                LOGGER.exception("Metadata poll failed, retrying next interval")
 
     @override
     async def close(self, **options: object) -> None:
