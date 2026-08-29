@@ -1,4 +1,6 @@
-# twitch-analytics
+# zevent-analytics
+
+![Zevent](img/zevent.jpg)
 
 ![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![uv](https://img.shields.io/badge/uv-package%20manager-DE5FE9?logo=uv&logoColor=white)
@@ -11,7 +13,7 @@
 ![Docker Compose](https://img.shields.io/badge/Docker%20Compose-NiFi%20stack-2496ED?logo=docker&logoColor=white)
 ![Ruff](https://img.shields.io/badge/lint%20%2F%20format-Ruff-D7FF64?logo=ruff&logoColor=black)
 ![ty](https://img.shields.io/badge/type%20check-ty-FCA121)
-[![CI](https://github.com/thoutmose/twitch-analytics/actions/workflows/ci.yml/badge.svg)](https://github.com/thoutmose/twitch-analytics/actions/workflows/ci.yml)
+[![CI](https://github.com/thoutmose/zevent-analytics/actions/workflows/ci.yml/badge.svg)](https://github.com/thoutmose/zevent-analytics/actions/workflows/ci.yml)
 
 Extracts live-stream data for every Twitch channel participating in
 [Zevent](https://zevent.fr/) — chat, viewer counts, stream metadata, and the
