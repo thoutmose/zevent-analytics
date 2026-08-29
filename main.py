@@ -1,9 +1,11 @@
 """Zevent multi-channel extractor: aggregates live-stream data for every Twitch
 channel currently participating in Zevent.
 
-The channel roster is fetched once at startup from zevent.fr/api/ (see
-zevent_api.py) rather than hardcoded, since it's ~300+ channels and changes
-from one edition to the next.
+The channel roster is fetched from zevent.fr/api/ (see zevent_api.py) rather
+than hardcoded, since it's ~300+ channels and changes from one edition to
+the next. It's fetched at startup, then re-fetched every
+ROSTER_REFRESH_INTERVAL_SECONDS so a channel that joins mid-event is picked
+up without a restart (see ZeventBot._roster_refresh_loop).
 
 Collects, per channel:
   - stream metadata: title, category, start time, viewer_count (polled from
@@ -35,6 +37,7 @@ import os
 import random
 import re
 import signal
+import time
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -57,8 +60,19 @@ _ = load_dotenv()
 LOGGER: logging.Logger = logging.getLogger("zevent_extractor")
 
 CLIENT_ID: str = os.environ["TWITCH_CLIENT_ID"]
+CLIENT_SECRET: str = os.environ["TWITCH_CLIENT_SECRET"]
 METADATA_SNAPSHOT_INTERVAL_SECONDS: int = int(
     os.environ.get("METADATA_SNAPSHOT_INTERVAL_SECONDS", "15")
+)
+# The roster otherwise only comes from zevent.fr/api/ once, at startup (see
+# module docstring) — this re-fetches it periodically so a channel added
+# mid-event gets picked up without a restart. Matched to 15s (rather than
+# something coarser) because that's the endpoint's own server-side refresh
+# cadence (see zevent_api.py) — polling faster would just re-read the same
+# data, and it costs one unauthenticated GET, not a Helix call, unless a
+# genuinely new channel is found.
+ROSTER_REFRESH_INTERVAL_SECONDS: int = int(
+    os.environ.get("ROSTER_REFRESH_INTERVAL_SECONDS", "15")
 )
 
 # Twitch caps both "get streams" and "get users" at 100 login/id values per call.
@@ -86,8 +100,6 @@ MAX_ROWS_PER_PARQUET_FILE: int = int(
 )
 FLUSH_INTERVAL_SECONDS: int = int(os.environ.get("FLUSH_INTERVAL_SECONDS", "30"))
 PARQUET_COMPRESSION: str = os.environ.get("PARQUET_COMPRESSION", "zstd")
-
-SCOPES: twitchio.Scopes = twitchio.Scopes()
 
 
 def _chunked(items: list[str], size: int) -> list[list[str]]:
@@ -189,7 +201,12 @@ class ChatConnection:
                 await self._connect_once()
                 # a clean iteration (should only end via cancellation) resets backoff
                 backoff = 5
-            except (aiohttp.ClientError, ConnectionResetError, asyncio.TimeoutError):
+            except Exception:
+                # Broad on purpose: anything from here (a network drop, but also
+                # e.g. a parquet write failure inside on_chat_message -> add() ->
+                # flush()) should reconnect and keep going rather than silently
+                # end chat capture for this shard's ~50 channels for the rest of
+                # a 55-hour event.
                 sleep_seconds = min(backoff + random.uniform(0, backoff), 60)
                 LOGGER.exception(
                     "IRC connection dropped (%d channels), reconnecting in %.1fs",
@@ -244,7 +261,7 @@ class ZeventBot(commands.Bot):
     batched Helix polls."""
 
     def __init__(self, channels: list[str]) -> None:
-        super().__init__(client_id=CLIENT_ID, scopes=SCOPES, prefix="!")
+        super().__init__(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, prefix="!")
         self.channels: list[str] = channels
         self.stats: dict[str, ChannelStats] = {}
         self.chat_writer: BatchParquetWriter = BatchParquetWriter(CHAT_DIR, "live_chat")
@@ -267,7 +284,7 @@ class ZeventBot(commands.Bot):
     async def event_ready(self) -> None:
         """Resolves broadcaster IDs, takes an initial poll, then starts all
         background loops."""
-        LOGGER.info("Authorized as user id: %s", self.bot_id)
+        LOGGER.info("Authorized with app token for client id: %s", CLIENT_ID)
         CHAT_DIR.mkdir(parents=True, exist_ok=True)
         METADATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -288,7 +305,13 @@ class ZeventBot(commands.Bot):
             missing_lower = {m.lower() for m in missing}
             self.channels = [c for c in self.channels if c.lower() not in missing_lower]
 
-        await self._poll_all_streams()
+        try:
+            await self._poll_all_streams()
+        except Exception:
+            # Don't let one bad Helix call at startup abort the whole bot before
+            # chat/IRC and the periodic loops even start — _metadata_snapshot_loop
+            # will retry this every METADATA_SNAPSHOT_INTERVAL_SECONDS anyway.
+            LOGGER.exception("Initial stream poll failed, continuing startup")
 
         connections = [
             ChatConnection(shard, self)
@@ -299,6 +322,7 @@ class ZeventBot(commands.Bot):
 
         self._spawn_background(self._metadata_snapshot_loop())
         self._spawn_background(self._flush_loop())
+        self._spawn_background(self._roster_refresh_loop())
         LOGGER.info(
             "Watching %d channels across %d IRC connection(s)",
             len(self.channels),
@@ -310,8 +334,11 @@ class ZeventBot(commands.Bot):
         continuously."""
         while True:
             await asyncio.sleep(FLUSH_INTERVAL_SECONDS)
-            self.chat_writer.flush()
-            self.metadata_writer.flush()
+            try:
+                self.chat_writer.flush()
+                self.metadata_writer.flush()
+            except Exception:
+                LOGGER.exception("Periodic flush failed, retrying next interval")
 
     def on_chat_message(
         self,
@@ -369,7 +396,10 @@ class ZeventBot(commands.Bot):
                     continue
                 live_by_login[stream.user.name.lower()] = stream
 
-        for login, stats in self.stats.items():
+        # list(...): _refresh_roster() can add entries to self.stats between
+        # awaits in this loop (fetch_streams above yields control); iterating
+        # a live dict that grows underneath it raises RuntimeError.
+        for login, stats in list(self.stats.items()):
             stream = live_by_login.get(login)
             if stream:
                 stats.is_live = True
@@ -410,13 +440,81 @@ class ZeventBot(commands.Bot):
 
     async def _metadata_snapshot_loop(self) -> None:
         """Runs _poll_all_streams() every METADATA_SNAPSHOT_INTERVAL_SECONDS,
-        forever."""
+        forever.
+
+        Unlike ChatConnection.run(), _poll_all_streams() had no error handling:
+        one Helix hiccup (timeout, rate limit, transient 5xx) would raise out of
+        this background task and silently kill metadata snapshots for every
+        channel for the rest of the run, with chat capture unaffected and no
+        visible crash. Catching and logging here lets the loop self-heal on the
+        next interval instead of dying for good.
+        """
         while True:
             await asyncio.sleep(METADATA_SNAPSHOT_INTERVAL_SECONDS)
             try:
                 await self._poll_all_streams()
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                LOGGER.exception("Metadata poll failed, retrying next interval")
+            except Exception:
+                LOGGER.exception(
+                    "Metadata snapshot poll failed, retrying next interval"
+                )
+
+    async def _roster_refresh_loop(self) -> None:
+        """Re-fetches the Zevent roster every ROSTER_REFRESH_INTERVAL_SECONDS
+        and starts watching any channel that has joined since startup.
+
+        Channels are only ever added, never removed here: a channel missing
+        from one API response is far more likely a transient zevent.fr
+        hiccup than an actual withdrawal, and a channel that really did stop
+        streaming already shows up as offline via _poll_all_streams.
+        """
+        while True:
+            await asyncio.sleep(ROSTER_REFRESH_INTERVAL_SECONDS)
+            try:
+                await self._refresh_roster()
+            except Exception:
+                LOGGER.exception("Roster refresh failed, retrying next interval")
+
+    async def _refresh_roster(self) -> None:
+        """Fetches the current roster and, for any login not already in
+        self.stats, resolves its broadcaster id, adds it to polling, and
+        spawns new IRC connection(s) sharded the same way as at startup."""
+        roster = await _fetch_roster()
+        new_logins = [c for c in roster if c.lower() not in self.stats]
+        if not new_logins:
+            return
+
+        new_channels: list[str] = []
+        for chunk in _chunked(new_logins, HELIX_BATCH_SIZE):
+            for user in await self.fetch_users(logins=chunk):
+                if user.name is None:
+                    LOGGER.warning(
+                        "Twitch user id=%s has no login name, skipping", user.id
+                    )
+                    continue
+                login = user.name.lower()
+                if login in self.stats:
+                    continue
+                self.stats[login] = ChannelStats(
+                    channel=user.name, broadcaster_id=str(user.id)
+                )
+                new_channels.append(user.name)
+
+        if not new_channels:
+            return
+
+        self.channels.extend(new_channels)
+        shards = _chunked(new_channels, CHANNELS_PER_IRC_CONNECTION)
+        for shard in shards:
+            self._spawn_background(ChatConnection(shard, self).run())
+
+        LOGGER.info(
+            "[roster] %d new channel(s) joined (%d new IRC connection(s)), "
+            "now watching %d total: %s",
+            len(new_channels),
+            len(shards),
+            len(self.channels),
+            new_channels,
+        )
 
     @override
     async def close(self, **options: object) -> None:
@@ -437,8 +535,20 @@ async def _fetch_roster() -> list[str]:
 
 
 def main() -> None:
-    """Entry point: fetches the roster, authorizes via Device Code Flow, then
-    runs forever."""
+    """Entry point: fetches the roster, authenticates with a Twitch app token,
+    then runs forever, restarting the whole bot on any unhandled crash.
+
+    Uses an app access token (Client Credentials Grant) rather than Device
+    Code Flow: Get Streams/Get Users are public, read-only endpoints that
+    don't need a user token, and an app token needs a confidential client
+    (client_id + client_secret) but never needs a human to authorize it, on
+    this startup or any crash-triggered restart after it — see
+    ZeventBot.__init__ and CLIENT_SECRET above. DCF was tried first and
+    dropped: its user token needs an hourly-ish refresh, and twitchio's
+    refresh occasionally raced and got rejected by Twitch as an invalid
+    refresh token, which stranded metadata polling until a human re-ran the
+    device flow — unacceptable for an unattended 55-hour event.
+    """
     logging_setup.setup_logging()
     _ = signal.signal(signal.SIGTERM, signal.default_int_handler)
 
@@ -446,16 +556,21 @@ def main() -> None:
         channels = await _fetch_roster()
         LOGGER.info("Fetched %d channels from zevent.fr/api/", len(channels))
         async with ZeventBot(channels) as bot:
-            resp = (await bot.login_dcf()) or {}
-            print(f"Authorize this app: {resp.get('verification_uri', '')}")
-            await bot.start_dcf(
-                device_code=resp.get("device_code"), interval=resp.get("interval", 5)
-            )
+            await bot.start(with_adapter=False, load_tokens=False, save_tokens=False)
 
-    try:
-        asyncio.run(runner())
-    except KeyboardInterrupt:
-        LOGGER.warning("Shutting down due to KeyboardInterrupt.")
+    backoff = 5
+    while True:
+        try:
+            asyncio.run(runner())
+            return
+        except KeyboardInterrupt:
+            LOGGER.warning("Shutting down due to KeyboardInterrupt.")
+            return
+        except Exception:
+            sleep_seconds = min(backoff, 60)
+            LOGGER.exception("main() crashed, restarting in %ds", sleep_seconds)
+            time.sleep(sleep_seconds)
+            backoff = min(backoff * 2, 60)
 
 
 if __name__ == "__main__":

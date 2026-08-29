@@ -153,33 +153,38 @@ async def poll_forever() -> None:
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
-                _write_checkpoint(snapshot)
+                try:
+                    _write_checkpoint(snapshot)
 
-                online = [s for s in snapshot.streamers if s.online]
-                LOGGER.info(
-                    "mode=%s total_donations=%s€ total_viewers=%s "
-                    "online_streamers=%d/%d",
-                    snapshot.website_mode,
-                    snapshot.total_donation_amount_eur,
-                    snapshot.total_viewer_count,
-                    len(online),
-                    len(snapshot.streamers),
-                )
-                LOGGER.info(
-                    "STATS %s", json.dumps(asdict(snapshot), ensure_ascii=False)
-                )
+                    online = [s for s in snapshot.streamers if s.online]
+                    LOGGER.info(
+                        "mode=%s total_donations=%s€ total_viewers=%s "
+                        "online_streamers=%d/%d",
+                        snapshot.website_mode,
+                        snapshot.total_donation_amount_eur,
+                        snapshot.total_viewer_count,
+                        len(online),
+                        len(snapshot.streamers),
+                    )
+                    LOGGER.info(
+                        "STATS %s", json.dumps(asdict(snapshot), ensure_ascii=False)
+                    )
 
-                # "streamers" is stringified to JSON text before pushing: NiFi's
-                # PutDatabaseRecord can't write a nested array-of-records field
-                # straight into a jsonb column (ClassCastException: MapRecord
-                # cannot be cast to Byte) — it needs a plain string it can hand
-                # to the JDBC driver, which `stringtype=unspecified` on the
-                # connection then lets Postgres coerce into jsonb.
-                row = asdict(snapshot)
-                row["streamers"] = json.dumps(row["streamers"], ensure_ascii=False)
-                nifi_client.push_batch_background(
-                    "zevent_api.py", "zevent_snapshot", [row]
-                )
+                    # "streamers" is stringified to JSON text before pushing: NiFi's
+                    # PutDatabaseRecord can't write a nested array-of-records field
+                    # straight into a jsonb column (ClassCastException: MapRecord
+                    # cannot be cast to Byte) — it needs a plain string it can hand
+                    # to the JDBC driver, which `stringtype=unspecified` on the
+                    # connection then lets Postgres coerce into jsonb.
+                    row = asdict(snapshot)
+                    row["streamers"] = json.dumps(row["streamers"], ensure_ascii=False)
+                    nifi_client.push_batch_background(
+                        "zevent_api.py", "zevent_snapshot", [row]
+                    )
+                except Exception:
+                    # e.g. a full disk on the checkpoint write — don't let it end
+                    # the whole poller for the rest of a 55-hour event.
+                    LOGGER.exception("Failed to process/push snapshot")
 
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
     finally:
