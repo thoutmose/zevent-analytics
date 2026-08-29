@@ -128,6 +128,57 @@ flowchart LR
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for the deployment topology, the
 reverse-proxy setup, and every deviation from the original design.
 
+### The NiFi flow, processor by processor
+
+![Apache NiFi flow](img/apache-nifi-flow.png)
+
+A live capture of the flow above (dev instance) — the numbers on each
+processor are 5-minute rolling stats, not fixed labels. Left to right, this
+is the ingestion path every batch from all three extractors takes:
+
+1. **`ListenHTTP`** — the ingestion endpoint (`NIFI_WEBHOOK_URL`). Each POST
+   is one complete, self-contained batch envelope (`batch_id`, `stream`,
+   `rows[]`) from one `nifi_client.push_batch` call, not a stream of
+   individual events — there's nothing to correlate across requests.
+2. **`EvaluateJsonPath`** — promotes the envelope's `$.stream` field
+   (`live_chat` / `metadata` / `zevent_snapshot` / `donation_goals`) onto the
+   flowfile as an attribute, so the next step can route without re-parsing
+   the body on every hop.
+3. **`RouteOnAttribute`** — the only branch point in the flow, on that
+   `stream` attribute: `insert` (the three append-only streams), `upsert`
+   (`donation_goals`, the one stream that overwrites in place), or
+   `unmatched` for anything else.
+4. **`SplitJson`** (one per branch) — expands the envelope's `rows[]` array
+   into one flowfile per row. Each row already carries its own `batch_id` +
+   `row_number` (set Python-side, see `nifi_client.py`) — that's what makes
+   a re-sent batch idempotent at the database layer, not anything NiFi does.
+5. **`PutDatabaseRecord`** (one per branch) — the sink. The INSERT branch
+   picks its target table (`bronze_live_chat` / `bronze_metadata_snapshots` /
+   `bronze_zevent_snapshots`) with a NiFi Expression Language ternary on the
+   `stream` attribute, so one processor covers three tables instead of three
+   near-identical ones. The UPSERT branch always writes
+   `bronze_donation_goals` with `Update Keys = participation_id, goal_id`.
+6. **`UpdateAttribute`** — every failure path in the flow (`EvaluateJsonPath`
+   failing on unparseable JSON, `RouteOnAttribute`'s `unmatched`, either
+   `PutDatabaseRecord` failing to write) is unified here before touching
+   disk, rewriting `filename` to `${filename}-${UUID()}`. This isn't
+   decorative: `SplitJson` gives every row from one batch the *same*
+   filename, and the next processor's conflict strategy is `fail` on a
+   duplicate name — without a uniquifier, only the first failing row per
+   batch ever reached disk and every other one was silently destroyed. See
+   [`ARCHITECTURE.md`](ARCHITECTURE.md) for the numbers from when this was
+   found.
+7. **`PutFile` (dead-letter)** — one file per failed row, name now
+   guaranteed unique, written to `nifi/dead-letter/` for manual replay (see
+   [Known limitations](#known-limitations)) — not an automated retry.
+
+Every connection here carries NiFi's default backpressure (10,000 flowfiles
+/ 1 GB): it just doesn't render as a number on an idle canvas — NiFi only
+color-codes a connection once its queue nears the threshold. A flow
+definition for all of this ships at
+[`flow-templates/zevent-ingest-flow.json`](flow-templates/zevent-ingest-flow.json)
+(see [`ARCHITECTURE.md`](ARCHITECTURE.md) for how to import it).
+
 ## Design decisions
 
 ### Why Apache NiFi
