@@ -1,5 +1,5 @@
 [project]
-name = "twitch-analytics"
+name = "zevent-analytics"
 version = "0.1.0"
 description = "Multi-channel Zevent/Twitch extractor feeding a NiFi -> PostgreSQL bronze pipeline"
 readme = "README.md"
