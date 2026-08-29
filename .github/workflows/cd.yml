@@ -1,0 +1,119 @@
+name: CD (srv-prod)
+
+# Deploys only the NiFi stack (docker-compose.yml + drivers/) — srv-prod runs
+# NiFi only, per README.md. main.py/zevent_api.py are run on demand, not by
+# this pipeline. Never triggers directly off `push`: it waits for the CI
+# workflow on main to report success, so a red build can never reach prod.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch: {} # manual re-run from the Actions tab if needed
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never let two deploys race each other against the same server.
+  group: cd-srv-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy NiFi stack to srv-prod
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # Requires a "production" environment in repo Settings -> Environments,
+    # with required reviewers configured — this is what turns every deploy
+    # into a manual-approval gate. See DEPLOYMENT.md.
+    environment:
+      name: production
+      url: https://${{ vars.SRV_PROD_NIFI_HOSTNAME || 'nifi.thoutmose.me' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Load deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SRV_PROD_SSH_KEY }}
+
+      - name: Pin known host key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          # SRV_PROD_KNOWN_HOSTS is the output of:
+          #   ssh-keyscan -p <port> <host>
+          # run once when srv-prod is provisioned. Pinning it here (instead of
+          # StrictHostKeyChecking=no) is what stops a MITM'd/spoofed host from
+          # silently accepting the deploy key. See DEPLOYMENT.md.
+          echo "${{ secrets.SRV_PROD_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Sync NiFi stack files
+        env:
+          SRV_PROD_HOST: ${{ secrets.SRV_PROD_HOST }}
+          SRV_PROD_USER: ${{ secrets.SRV_PROD_USER }}
+          SRV_PROD_SSH_PORT: ${{ secrets.SRV_PROD_SSH_PORT || '22' }}
+          DEPLOY_PATH: ${{ vars.SRV_PROD_DEPLOY_PATH || '/opt/twitch-analytics' }}
+        run: |
+          ssh -p "$SRV_PROD_SSH_PORT" "$SRV_PROD_USER@$SRV_PROD_HOST" \
+            "mkdir -p '$DEPLOY_PATH/drivers' '$DEPLOY_PATH/nifi/dead-letter'"
+
+          # .env (NIFI_ADMIN_USERNAME/PASSWORD, NIFI_WEB_PROXY_HOST) is
+          # provisioned once by hand on srv-prod and never touched by CI — see
+          # DEPLOYMENT.md. Only the stack definition and driver jar are synced.
+          # nifi/dead-letter/ is deliberately excluded: it's a live volume
+          # mount with production dead-letter output, not a deploy artifact.
+          rsync -az \
+            -e "ssh -p $SRV_PROD_SSH_PORT" \
+            docker-compose.yml \
+            "$SRV_PROD_USER@$SRV_PROD_HOST:$DEPLOY_PATH/docker-compose.yml"
+
+          rsync -az --delete \
+            -e "ssh -p $SRV_PROD_SSH_PORT" \
+            drivers/ \
+            "$SRV_PROD_USER@$SRV_PROD_HOST:$DEPLOY_PATH/drivers/"
+
+      - name: Apply stack (docker compose up -d)
+        env:
+          SRV_PROD_HOST: ${{ secrets.SRV_PROD_HOST }}
+          SRV_PROD_USER: ${{ secrets.SRV_PROD_USER }}
+          SRV_PROD_SSH_PORT: ${{ secrets.SRV_PROD_SSH_PORT || '22' }}
+          DEPLOY_PATH: ${{ vars.SRV_PROD_DEPLOY_PATH || '/opt/twitch-analytics' }}
+        run: |
+          ssh -p "$SRV_PROD_SSH_PORT" "$SRV_PROD_USER@$SRV_PROD_HOST" "
+            set -euo pipefail
+            cd '$DEPLOY_PATH'
+            docker compose pull
+            docker compose up -d --remove-orphans
+          "
+
+      - name: Health check
+        env:
+          SRV_PROD_HOST: ${{ secrets.SRV_PROD_HOST }}
+          SRV_PROD_USER: ${{ secrets.SRV_PROD_USER }}
+          SRV_PROD_SSH_PORT: ${{ secrets.SRV_PROD_SSH_PORT || '22' }}
+        run: |
+          ssh -p "$SRV_PROD_SSH_PORT" "$SRV_PROD_USER@$SRV_PROD_HOST" "
+            for i in \$(seq 1 10); do
+              if curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/nifi/ | grep -qE '^(200|302)$'; then
+                echo 'NiFi UI is up'
+                exit 0
+              fi
+              echo \"waiting for NiFi (attempt \$i/10)...\"
+              sleep 10
+            done
+            echo 'NiFi did not come up in time' >&2
+            exit 1
+          "
+
+      - name: Deploy summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy to srv-prod"
+            echo "- Triggered by: ${{ github.event_name }}"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"

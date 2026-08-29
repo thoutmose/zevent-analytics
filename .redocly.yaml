@@ -1,0 +1,14 @@
+# openapi.yaml documents external calls this repo *makes* (Twitch, zevent.fr),
+# not an API this repo *serves* — so rules aimed at API providers don't apply:
+#   - operation-4xx-response: these aren't our operations to design error
+#     responses for, they're calls into someone else's already-live API.
+#   - no-path-trailing-slash: /api/ is documented with the trailing slash
+#     because that's the real, exact path zevent.fr/api/ serves.
+#   - info-license: this document has no license of its own to declare.
+extends:
+  - recommended
+
+rules:
+  operation-4xx-response: off
+  no-path-trailing-slash: off
+  info-license: off

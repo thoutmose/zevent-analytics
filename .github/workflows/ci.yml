@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same branch/PR instead of burning minutes on
+# a push that's already been overtaken by a newer one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege default; individual jobs opt into more where they need it
+# (dependency-review needs contents:read + pull-requests:write via its action).
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.11.31"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint-and-typecheck:
+    name: Lint & type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - run: uv sync --group dev --python ${{ env.PYTHON_VERSION }}
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: ruff check
+        run: uv run ruff check --output-format=github .
+
+      - name: ty check
+        run: uv run ty check .
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - run: uv sync --group dev --python ${{ env.PYTHON_VERSION }}
+
+      - name: pytest
+        run: uv run pytest --cov=. --cov-report=term-missing --cov-report=xml -v
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          retention-days: 14
+
+  sql-lint:
+    name: SQL lint (sqlfluff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - run: uv sync --group dev --python ${{ env.PYTHON_VERSION }}
+
+      - run: uv run sqlfluff lint sql/
+
+  api-lint:
+    name: OpenAPI lint (openapi.yaml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: npx --yes @redocly/cli@1 lint openapi.yaml
+
+  config-validate:
+    name: Validate docker-compose / YAML
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: docker compose config
+        # NIFI_ADMIN_PASSWORD is only interpolated for this syntax/schema check —
+        # never a real credential, and never written anywhere.
+        run: |
+          NIFI_ADMIN_PASSWORD=ci-placeholder-value \
+            docker compose -f docker-compose.yml config --quiet
+
+      - name: yamllint
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          file_or_dir: docker-compose.yml logging.yaml .github/workflows/
+          config_data: |
+            extends: default
+            rules:
+              line-length: disable
+              document-start: disable
+              truthy:
+                check-keys: false
+
+  security:
+    name: Security scans
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # gitleaks needs history to scan past commits
+
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - run: uv sync --group dev --python ${{ env.PYTHON_VERSION }}
+
+      - name: Static security lint (bandit)
+        run: uv run bandit -c pyproject.toml -r .
+
+      - name: Dependency vulnerability scan (pip-audit)
+        run: uv run pip-audit --strict
+
+  dependency-review:
+    name: Dependency review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/dependency-review-action@v4
+
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs:
+      - lint-and-typecheck
+      - test
+      - sql-lint
+      - api-lint
+      - config-validate
+      - security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any required job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
