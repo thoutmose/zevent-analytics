@@ -31,10 +31,10 @@ jobs:
       name: production
       url: https://${{ vars.SRV_PROD_NIFI_HOSTNAME || 'nifi.thoutmose.me' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Load deploy key
-        uses: webfactory/ssh-agent@v0.9.0
+        uses: webfactory/ssh-agent@v0.10.0
         with:
           ssh-private-key: ${{ secrets.SRV_PROD_SSH_KEY }}
 
