@@ -12,8 +12,7 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Least-privilege default; individual jobs opt into more where they need it
-# (dependency-review needs contents:read + pull-requests:write via its action).
+# Least-privilege default; individual jobs opt into more where they need it.
 permissions:
   contents: read
 
@@ -146,23 +145,6 @@ jobs:
 
       - name: Dependency vulnerability scan (pip-audit)
         run: uv run pip-audit --strict
-
-  dependency-review:
-    name: Dependency review
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    # Not in ci-passed's `needs:` — this action hard-errors ("Dependency review is
-    # not supported on this repository") because Dependency graph isn't available on
-    # a private repo without a GitHub Pro/Advanced Security upgrade, which this repo
-    # doesn't have. continue-on-error keeps the job's own conclusion green instead of
-    # a permanent, unactionable red X on every PR until that's purchased.
-    continue-on-error: true
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/dependency-review-action@v4
 
   ci-passed:
     name: CI passed
