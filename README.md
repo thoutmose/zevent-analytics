@@ -211,9 +211,18 @@ multi-channel rewrite:
   `UNIQUE (batch_id, row_number)` (`sql/001_bronze_schema.sql`) makes a
   re-sent batch a no-op instead of a duplicate.
 - **Dead-lettering, not data loss** — `PutDatabaseRecord`'s `failure`
-  relationship routes to a `PutFile` processor writing into
-  `nifi/dead-letter/`, so a bad row is captured on disk instead of
-  silently dropped.
+  relationship (and `RouteOnAttribute`'s `unmatched`) routes through an
+  `UpdateAttribute` processor that rewrites `filename` to
+  `${filename}-${UUID()}` before reaching `PutFile`, then lands in
+  `nifi/dead-letter/`. The `UpdateAttribute` step matters because every row
+  NiFi splits out of one source batch inherits that batch's original
+  `filename` — without it, `PutFile`'s `fail`-on-conflict strategy plus its
+  auto-terminated `failure` relationship meant only the *first* failing row
+  per batch ever reached disk; every other one silently vanished (confirmed
+  on the dev NiFi instance: 27,890 filename collisions logged against only
+  164 files that actually survived in `nifi/dead-letter/`). If `srv-prod`'s
+  NiFi flow was built the same way, it likely has the same gap and needs the
+  same fix.
 - **Graceful shutdown waits for in-flight pushes** —
   [`nifi_client.wait_for_pending_pushes`](nifi_client.py) is awaited
   before the event loop closes, so a NiFi push isn't cancelled mid-request
