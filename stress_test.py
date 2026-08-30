@@ -139,7 +139,7 @@ async def main() -> None:
     run_id = uuid.uuid4().hex[:8]
     print(f"# Stress test run_id={run_id} target={args.url}")
     print(
-        "# Cleanup after: DELETE FROM bronze_live_chat WHERE "
+        "# Cleanup after: DELETE FROM bronze_live_chat WHERE "  # nosec B608 - printed operator hint only, never executed as SQL
         f"channel = 'stress-test-{run_id}';\n"
     )
 
