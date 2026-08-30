@@ -111,12 +111,14 @@ jobs:
           ssh -p "$SRV_PROD_SSH_PORT" "$SRV_PROD_USER@$SRV_PROD_HOST" "
             set -euo pipefail
             cd '$DEPLOY_PATH'
-            docker compose pull
-            # --env-file .env.nifi: NIFI_ADMIN_USERNAME/PASSWORD and
-            # NIFI_WEB_PROXY_HOST live in their own file, readable by the
-            # deploy user's group — deploy must never be able to read the
-            # main .env, which also holds the Python extractors' Twitch/
-            # Postgres secrets. See DEPLOYMENT.md.
+            # --env-file .env.nifi on both: Compose parses/interpolates the
+            # whole compose file up front regardless of subcommand, so even
+            # 'pull' needs it, not just 'up'. NIFI_ADMIN_USERNAME/PASSWORD
+            # and NIFI_WEB_PROXY_HOST live in their own file, readable by
+            # the deploy user's group — deploy must never be able to read
+            # the main .env, which also holds the Python extractors'
+            # Twitch/Postgres secrets. See DEPLOYMENT.md.
+            docker compose --env-file .env.nifi pull
             docker compose --env-file .env.nifi up -d --remove-orphans
           "
 
