@@ -10,9 +10,11 @@ see "Importing the flow template" below) ships at
 | Host | Role |
 |---|---|
 | srv-dev | Dev machine — runs the Python extractors, this repo's checkout, and its own dev NiFi (`nifi-dev.thoutmose.me`) |
-| srv-prod | Runs Apache NiFi only (`docker-compose.yml`), nothing else — `nifi.thoutmose.me` |
+| srv-prod | Prod extractors (`twitch-analytics-prod` checkout) + Apache NiFi (`docker-compose.yml`) — `nifi.thoutmose.me` |
 | srv-db | PostgreSQL + PgBouncer (`bronze_*` tables, in both a `zevent` and a `zevent-dev` database). Not managed by this repo |
+| srv-services | Cold-storage target for `archive_parquet.py`/`archive_logs.py` (see README's "Archiving old Parquet files and log backups") |
 | srv-npm | Reverse proxy in front of `*.thoutmose.me` hostnames |
+| srv-monitoring | Monitoring stack. Standalone — not integrated with this repo |
 
 Actual addresses (Tailscale IPs, LAN IPs, ports) deliberately aren't listed
 here — this file is committed to git. Resolve hosts by their Tailscale
