@@ -27,7 +27,7 @@ UV_BIN="$(command -v uv)"
 # comment so re-runs replace rather than duplicate it. $1: marker text
 # (used verbatim as the crontab comment), $2: the command to run hourly.
 install_cron_line() {
-    local marker="# $1 (managed by setup_archive.sh)"
+    local marker="# $1 ($(pwd)) (managed by setup_archive.sh)"
     local new_line="0 * * * * cd $(pwd) && $2  $marker"
     local existing updated
     existing="$(crontab -l 2>/dev/null || true)"
