@@ -84,12 +84,16 @@ jobs:
           # level (that's thoutmose's checkout root), so rsync's default
           # write-a-temp-file-then-rename approach fails — it needs write on
           # the containing directory for that, not just the file.
-          rsync -az --inplace \
+          # --no-owner --no-group: -a's default owner/group preservation
+          # tries to chgrp the destination to match the source, which fails
+          # since deploy doesn't own these files (only an owner or root can
+          # chgrp) — group is already fixed up once, by hand, on srv-prod.
+          rsync -az --inplace --no-owner --no-group \
             -e "ssh -p $SRV_PROD_SSH_PORT" \
             docker-compose.yml \
             "$SRV_PROD_USER@$SRV_PROD_HOST:$DEPLOY_PATH/docker-compose.yml"
 
-          rsync -az --delete \
+          rsync -az --delete --no-owner --no-group \
             -e "ssh -p $SRV_PROD_SSH_PORT" \
             drivers/ \
             "$SRV_PROD_USER@$SRV_PROD_HOST:$DEPLOY_PATH/drivers/"
