@@ -478,7 +478,10 @@ entirely separate checkouts on two separate machines — `twitch-analytics` on
 `twitch-analytics-prod` on `srv-prod`, pointing at srv-prod's own local NiFi
 (`zevent` database) — each with its own `.env`. Each checkout has its own
 `.tio.tokens.json`, so each needs its own one-time Twitch device-code
-approval.
+approval. On srv-prod, that same checkout is also where CD deploys the NiFi
+stack itself (`docker-compose.yml` + `drivers/` — see DEPLOYMENT.md); on
+srv-dev, NiFi is set up by hand in its own checkout the same way, just
+without CD.
 
 ```bash
 # Start (dev):

@@ -1,3 +1,8 @@
+# Pins the Compose project name so it stays "twitch-analytics" (and therefore
+# the named volumes below keep resolving to twitch-analytics_nifi-*) no
+# matter which directory this file is deployed into — see DEPLOYMENT.md.
+name: twitch-analytics
+
 services:
   nifi:
     image: apache/nifi:1.24.0
