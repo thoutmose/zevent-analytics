@@ -352,8 +352,8 @@ multi-channel rewrite:
   connection limit.
 - **NiFi's built-in per-connection backpressure** — every connection
   between processors has an object/size threshold NiFi enforces natively;
-  none have been load-tested against real Zevent traffic yet (see
-  [Performance](#performance) below).
+  synthetically load-tested on `srv-dev` (see [Performance](#performance)
+  below), though not yet against real Zevent traffic.
 - **Archival, not accumulation** —
   [`archive_parquet.py`](archive_parquet.py)/[`archive_logs.py`](archive_logs.py)
   are standalone, cron-run scripts (not part of the always-on extractors):
@@ -367,13 +367,110 @@ multi-channel rewrite:
 
 ## Performance
 
-Not yet measured under real load — Zevent hasn't happened yet on this
-timeline. This section will be filled in after the event with real
-numbers pulled from `logging/` (see [Logging](#logging)) and PostgreSQL
-itself (row counts, `nifi/dead-letter/` contents, restart count), not
-projected or assumed ones. Planned to report: sustained throughput,
-dead-letter rate, IRC reconnect count per shard, and whether any manual
-restart was needed over the event's full duration.
+Real event numbers (throughput, dead-letter rate, IRC reconnect count per
+shard, manual-restart count) are still not yet measured — Zevent hasn't
+happened yet on this timeline, and this note will be filled in afterward
+with real numbers pulled from `logging/` (see [Logging](#logging)) and
+PostgreSQL itself, not projected ones.
+
+What *has* been measured: a synthetic capacity/stress test of the
+ingestion pipeline's ceiling, run against the dev NiFi instance (`srv-dev`,
+`zevent-dev` database) on 2026-08-30 via `stress_test.py` — a ramping load
+generator posting synthetic `live_chat` batches to `/ingest`. This
+exercises the pipeline itself (webhook → NiFi → Postgres), not real Twitch
+chat volume.
+
+### Baseline (NiFi's untuned defaults)
+
+Every processor in the flow defaults to NiFi's `Concurrent Tasks = 1`; the
+`DBCPConnectionPool` defaults to `Max Total Connections = 8`; every
+inter-processor connection defaults to a 10,000-flowfile backpressure
+threshold.
+
+- **1 concurrent producer:** ~220 req/s (~4,400 rows/s) accepted, 0%
+  errors, sustained.
+- **≥2 concurrent producers:** immediate HTTP 503 from `ListenHTTP`,
+  within ~5ms — confirmed via NiFi's own servlet response and logs, not a
+  client-side artifact. Root cause: with every processor capped at 1
+  concurrent task, the queue immediately downstream of `ListenHTTP` fills
+  almost instantly, and `ListenHTTP` starts rejecting new connections
+  outright instead of queuing them.
+- **Practical risk this exposes:** `zevent-main.service`,
+  `zevent-api.service`, and `zevent-donation-goals.service` all push to
+  the same `NIFI_WEBHOOK_URL` independently. `nifi_client.push_batch`
+  deliberately does not retry a definite HTTP-level rejection (only
+  ambiguous timeouts — see [Reliability
+  mechanisms](#reliability-mechanisms)), so two services posting at the
+  same instant could silently drop one batch under this untuned default.
+
+### After retuning
+
+Changes applied live via the NiFi REST API (see the persistence caveat
+below):
+
+| Setting | Before | After |
+|---|---|---|
+| `ListenHTTP` / `PutDatabaseRecord (INSERT)` Concurrent Tasks | 1 | 8 |
+| `EvaluateJsonPath` / `RouteOnAttribute` / `SplitJson (insert)` Concurrent Tasks | 1 | 4 |
+| `SplitJson (upsert)` / `PutDatabaseRecord (UPSERT)` / dead-letter processors Concurrent Tasks | 1 | 2 |
+| `DBCPConnectionPool` Max Total Connections | 8 | 24 |
+| Connection backpressure object threshold | 10,000 | 50,000 |
+| `nifi.content.repository.archive.max.retention.period` | 7 days | 2 minutes |
+| `nifi.content.repository.archive.max.usage.percentage` | 50% | 90% |
+
+Results:
+
+- **Webhook acceptance:** clean (0% errors) up to concurrency=25, ~162,850
+  rows/s, p50/p95/p99 latency 7/12/22ms.
+- **Ceiling moved, not removed:** error rate crosses 20% at concurrency=50;
+  full saturation (100% errors) at concurrency=100. The breaking point
+  shifted from "any 2nd concurrent connection" to roughly 25–50 concurrent
+  producers.
+- **Sustained, steady-state database insert rate: ~2,700–3,000 rows/sec**,
+  measured directly against `bronze_live_chat` row growth (not just
+  HTTP-layer acceptance) — comfortably above the ~190 msg/s peak estimated
+  in [Reliability mechanisms](#reliability-mechanisms).
+
+### Stability findings
+
+- **Content-repository archive throttling is a whole-partition check, not
+  a NiFi-specific one.** `nifi.content.repository.archive.max.usage.percentage`
+  compares against the entire filesystem NiFi's content repo lives on —
+  on a disk already >50% full from unrelated data, sustained high-volume
+  writes stall (`Unable to write flowfile content ... waiting for archive
+  cleanup`) regardless of how little NiFi itself has archived. Hit this on
+  `srv-dev` (a shared 38GB disk, ~69% used from non-NiFi data) well before
+  NiFi's own footprint was meaningful (its archive was 1.64MB at the time).
+- **Deep queues degrade throughput non-linearly.** Once a connection's
+  queue passes NiFi's in-memory swap threshold (10,000 flowfiles), it
+  starts swapping to disk; a backlog that oscillates around that threshold
+  causes repeated swap-out/swap-in churn that dropped measured drain
+  throughput from ~3,000 rows/s to ~60 rows/s. Keeping bursts under ~10K
+  flowfiles deep (or raising the swap threshold alongside backpressure)
+  avoids the cliff.
+- **`DBCPConnectionPool`'s `Password` property is masked (`********`) on
+  every `GET`.** Re-submitting a fetched `properties` dict verbatim on a
+  `PUT` — even to change an unrelated property like pool size — silently
+  overwrites the real password with that placeholder. Caused an
+  ~8.5-minute production DB-write outage on `srv-dev` during this testing
+  (12:45:36–12:54:05 UTC, 2026-08-30) before being caught and reverted.
+  Any future scripted config change via the NiFi API must strip or
+  re-supply sensitive properties explicitly, never round-trip them.
+
+### Caveats
+
+- These are synthetic capacity numbers from `srv-dev`, not real Zevent
+  traffic — the real-event numbers noted at the top of this section are
+  still pending.
+- The retuned settings above were applied live via the NiFi REST API and a
+  `nifi.properties` edit inside the running container. **Neither is
+  persisted** — recreating the container (`docker compose up
+  --force-recreate`, or any rebuild — a plain `docker restart` is fine)
+  reverts both to NiFi's defaults, silently re-introducing the
+  concurrency-of-1 ceiling. If these settings should be permanent, they
+  need to move into the flow template
+  (`flow-templates/zevent-ingest-flow.json`) and
+  `docker-compose.yml`/a mounted `nifi.properties` respectively.
 
 ## Project structure
 
@@ -739,12 +836,13 @@ already covered in [Reliability mechanisms](#reliability-mechanisms) and
   counter/gauge surface during the event itself, so a developing problem
   (e.g. a stuck IRC shard) is only visible by tailing logs, not by
   glancing at a dashboard.
-- **NiFi backpressure and PgBouncer pool sizing are both unverified under
-  real load.** NiFi's per-connection backpressure is already noted as
-  untested; the same applies to PgBouncer's connection pool against the
-  ~190 msg/s peak fan-out estimated in [Reliability
-  mechanisms](#reliability-mechanisms) — neither has been load-tested end
-  to end.
+- **PgBouncer's own pool sizing is still unverified under real load.**
+  NiFi's per-connection backpressure and its `DBCPConnectionPool` sizing
+  have now been synthetically load-tested (see
+  [Performance](#performance) — ~2,700–3,000 rows/s sustained), but that
+  only exercises NiFi's side of the JDBC connection; PgBouncer's own pool
+  config on `srv-db` (not managed by this repo) against that same
+  throughput hasn't been separately verified.
 
 ## Future data analysis tooling
 
