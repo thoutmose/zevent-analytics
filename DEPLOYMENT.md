@@ -57,7 +57,43 @@ sudo usermod -aG twitch-deploy <the user the extractors' checkout belongs to>
 cd ~/twitch-analytics-prod
 sudo chgrp -R twitch-deploy docker-compose.yml drivers nifi
 sudo chmod -R g+rwX drivers nifi
+sudo chmod g+s drivers nifi   # new files rsync'd in inherit the group
 sudo chmod g+rw docker-compose.yml
+```
+
+Group write on those paths isn't enough on its own — `deploy` also needs
+*traversal* rights on every directory above them (the home directory is
+normally `750`, which blocks `deploy` entirely), and it must never get
+that by joining the checkout owner's personal group, since that would also
+grant read access to `.env`. Use a `setfacl` execute-only grant instead —
+this lets `deploy` pass through without being able to list either
+directory's contents or read anything it wasn't explicitly given access to:
+
+```bash
+sudo apt-get install -y acl   # if setfacl isn't already installed
+sudo setfacl -m g:twitch-deploy:x ~                        # the home dir
+sudo setfacl -m g:twitch-deploy:x ~/twitch-analytics-prod   # the checkout root
+```
+
+One more wrinkle: `deploy` has *write* access to `docker-compose.yml` but
+not *ownership* of it (the checkout owner is), and two things that need
+ownership, not just write access, would otherwise break the sync:
+
+- rsync's default behavior is to write a temp file next to the target and
+  rename it into place — renaming needs write on the *containing*
+  directory, which `deploy` deliberately doesn't have. `--inplace` writes
+  directly to the target file instead, which only needs the file's own
+  write bit.
+- rsync's archive mode (`-a`) also tries to replicate the source's owner,
+  group, permissions, and timestamps onto the destination — each of those
+  requires being the file's owner (or root), which `deploy` isn't. Pass
+  `--no-owner --no-group --no-perms --no-times` (or just don't use `-a`)
+  so only file *content* transfers.
+
+`docker-compose.yml`'s group ownership only needs setting once — a later
+`git checkout`/`merge`/`pull` run directly in this checkout (as opposed to
+CD's rsync, which never touches it) rewrites the file and silently drops
+the custom group, so re-run the `chgrp`/`chmod` above if that ever happens.
 sudo chmod g+s drivers nifi   # new files rsync'd in inherit the group
 ```
 
@@ -95,24 +131,35 @@ fine as plain variables):
 | `SRV_PROD_DEPLOY_PATH` | the extractors' checkout, e.g. `/home/thoutmose/twitch-analytics-prod` (only needed if it's not the literal path `/opt/twitch-analytics`) |
 | `SRV_PROD_NIFI_HOSTNAME` | only if not `nifi.thoutmose.me` (cosmetic — shown as the environment URL in the Actions UI) |
 
-### 5. `.env` on srv-prod
+### 5. `.env.nifi` on srv-prod
 
 `docker-compose.yml` reads `NIFI_ADMIN_USERNAME`, `NIFI_ADMIN_PASSWORD`, and
-`NIFI_WEB_PROXY_HOST` from a `.env` file next to it — the same `.env` the
-Python extractors read their own settings from (see README.md), since NiFi
-and the extractors now share one checkout. CD deliberately never writes
-this file — add these three keys to that `.env` once, by hand, and they'll
-persist across deploys:
+`NIFI_WEB_PROXY_HOST` for its `${...}` interpolation from a **separate**
+`.env.nifi` file next to it — deliberately not the same `.env` the Python
+extractors read their Twitch/Postgres secrets from, even though both now
+live in the same checkout. `docker compose up` has to read whichever file
+supplies those values, and it runs as `deploy`; `deploy` can be given read
+access to `.env.nifi` alone via the shared group, but must never be able to
+read the main `.env`. CD deliberately never writes `.env.nifi` — create it
+once, by hand, and pass `--env-file .env.nifi` on every `docker compose`
+invocation that needs it (CD's "Apply stack" step already does):
 
 ```bash
 # On srv-prod:
-cat >> /home/thoutmose/twitch-analytics-prod/.env <<'EOF'
+cat > /home/thoutmose/twitch-analytics-prod/.env.nifi <<'EOF'
 NIFI_ADMIN_USERNAME=admin
 NIFI_ADMIN_PASSWORD=<a real password, min 12 chars>
 NIFI_WEB_PROXY_HOST=nifi.thoutmose.me
 EOF
-chmod 600 /home/thoutmose/twitch-analytics-prod/.env
+sudo chown <checkout owner>:twitch-deploy /home/thoutmose/twitch-analytics-prod/.env.nifi
+chmod 640 /home/thoutmose/twitch-analytics-prod/.env.nifi   # owner rw, group r, other none
 ```
+
+For any manual `docker compose` command on this checkout (not just CD's),
+remember `--env-file .env.nifi` — without it, Compose falls back to
+looking in `.env` (or nowhere), and `NIFI_ADMIN_PASSWORD` has no default
+(`${NIFI_ADMIN_PASSWORD:?...}`), so the command fails loudly rather than
+silently misconfiguring.
 
 ## What the pipeline actually does
 
