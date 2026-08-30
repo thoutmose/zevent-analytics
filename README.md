@@ -200,7 +200,7 @@ flowchart LR
         DEV["srv-dev<br/>extractors + dev NiFi<br/>VM · 4 vCPU / 8 GB / 40 GB"]
         PROD["srv-prod<br/>extractors + prod NiFi<br/>VM · 6 vCPU / 12 GB / 40 GB"]
         DB["srv-db<br/>PostgreSQL + PgBouncer<br/>VM · 4 vCPU / 8 GB / 100 GB"]
-        SVC["srv-services<br/>cold-storage archive<br/>VM · 6 vCPU / 12 GB / 450 GB"]
+        SVC["srv-services<br/>cold-storage archive + pgAdmin<br/>VM · 6 vCPU / 12 GB / 450 GB"]
         MON["srv-monitoring<br/>standalone, unused by this repo<br/>LXC · 2 vCPU / 2 GB / 20 GB"]
     end
     CD["cd.yml runner<br/>(GitHub Actions)"]
@@ -212,6 +212,7 @@ flowchart LR
     CD -. "Tailscale, deploy" .-> PROD
     DEV -. "archive_parquet.py / archive_logs.py" .-> SVC
     PROD -. "archive_parquet.py / archive_logs.py" .-> SVC
+    SVC -. "pgAdmin" .-> DB
 ```
 
 | Host | Role | Type | vCPU | RAM | Disk |
@@ -219,7 +220,7 @@ flowchart LR
 | `srv-dev` | Dev machine — extractors + this repo's checkout + dev NiFi | VM | 4 | 8 GB | 40 GB |
 | `srv-prod` | Prod machine — extractors + this repo's checkout + prod NiFi  | VM | 6 | 12 GB | 40 GB |
 | `srv-db` | PostgreSQL + PgBouncer — not managed by this repo | VM | 4 | 8 GB | 100 GB |
-| `srv-services` | Cold-storage target for [`archive_parquet.py`](archive_parquet.py)/[`archive_logs.py`](archive_logs.py) | VM | 6 | 12 GB | 450 GB |
+| `srv-services` | Cold-storage target for [`archive_parquet.py`](archive_parquet.py)/[`archive_logs.py`](archive_logs.py), plus [pgAdmin](https://www.pgadmin.org/) (`dpage/pgadmin4`, port 5050) for ad-hoc Postgres administration | VM | 6 | 12 GB | 450 GB |
 | `srv-npm` | Reverse proxy in front of `*.thoutmose.me` | LXC | 2 | 2 GB | 8 GB |
 | `srv-monitoring` | Monitoring stack — standalone, not integrated with this repo | LXC | 2 | 2 GB | 20 GB |
 | **Total** | | | **24** | **44 GB** | **658 GB** |
@@ -478,10 +479,13 @@ entirely separate checkouts on two separate machines — `twitch-analytics` on
 `twitch-analytics-prod` on `srv-prod`, pointing at srv-prod's own local NiFi
 (`zevent` database) — each with its own `.env`. Each checkout has its own
 `.tio.tokens.json`, so each needs its own one-time Twitch device-code
-approval. On srv-prod, that same checkout is also where CD deploys the NiFi
-stack itself (`docker-compose.yml` + `drivers/` — see DEPLOYMENT.md); on
-srv-dev, NiFi is set up by hand in its own checkout the same way, just
-without CD.
+approval. On srv-prod, that same checkout is also where CD deploys to: the
+NiFi stack (`docker-compose.yml` + `drivers/`), the Python extractors and
+archive scripts (source, `sql/`, dependency files), and — via a narrowly
+scoped sudoers grant for the deploy user — a `uv sync` plus a restart of the
+three `zevent-*-prod` systemd units (see DEPLOYMENT.md); on srv-dev, both
+NiFi and the extractors are set up and updated by hand in its own checkout,
+just without CD.
 
 ```bash
 # Start (dev):
@@ -668,7 +672,9 @@ All of the above are expected to pass clean on every file in this repo — CI
 checks, plus OpenAPI lint, `docker-compose.yml`/YAML validation, and secret
 scanning, on every push and pull request. CD
 ([`.github/workflows/cd.yml`](.github/workflows/cd.yml)) deploys the NiFi
-stack to srv-prod after CI passes on `main`, gated by manual approval — see
+stack, the Python extractors, and the archive scripts to srv-prod after CI
+passes on `main` — refreshing dependencies and restarting the three
+`zevent-*-prod` systemd units — gated by manual approval — see
 [`DEPLOYMENT.md`](DEPLOYMENT.md) for setup and how it works.
 
 ## Known limitations
