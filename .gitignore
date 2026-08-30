@@ -11,6 +11,7 @@ wheels/
 
 # Secrets and local Twitch auth cache
 .env
+.env.nifi
 .tio.tokens.json
 
 # Parquet output landing zone (one file per chat message/metadata snapshot)

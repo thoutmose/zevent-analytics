@@ -112,7 +112,12 @@ jobs:
             set -euo pipefail
             cd '$DEPLOY_PATH'
             docker compose pull
-            docker compose up -d --remove-orphans
+            # --env-file .env.nifi: NIFI_ADMIN_USERNAME/PASSWORD and
+            # NIFI_WEB_PROXY_HOST live in their own file, readable by the
+            # deploy user's group — deploy must never be able to read the
+            # main .env, which also holds the Python extractors' Twitch/
+            # Postgres secrets. See DEPLOYMENT.md.
+            docker compose --env-file .env.nifi up -d --remove-orphans
           "
 
       - name: Health check
