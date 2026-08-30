@@ -1,8 +1,9 @@
 name: CD (srv-prod)
 
-# Deploys only the NiFi stack (docker-compose.yml + drivers/) — srv-prod runs
-# NiFi only, per README.md. main.py/zevent_api.py are run on demand, not by
-# this pipeline. Never triggers directly off `push`: it waits for the CI
+# Deploys only the NiFi stack (docker-compose.yml + drivers/) into the same
+# checkout that main.py/zevent_api.py run from on srv-prod (see README.md) —
+# it doesn't touch those scripts, which are started on demand, independent
+# of this pipeline. Never triggers directly off `push`: it waits for the CI
 # workflow on main to report success, so a red build can never reach prod.
 on:
   workflow_run:
@@ -70,11 +71,15 @@ jobs:
           ssh -p "$SRV_PROD_SSH_PORT" "$SRV_PROD_USER@$SRV_PROD_HOST" \
             "mkdir -p '$DEPLOY_PATH/drivers' '$DEPLOY_PATH/nifi/dead-letter'"
 
-          # .env (NIFI_ADMIN_USERNAME/PASSWORD, NIFI_WEB_PROXY_HOST) is
-          # provisioned once by hand on srv-prod and never touched by CI — see
-          # DEPLOYMENT.md. Only the stack definition and driver jar are synced.
-          # nifi/dead-letter/ is deliberately excluded: it's a live volume
-          # mount with production dead-letter output, not a deploy artifact.
+          # NIFI_ADMIN_USERNAME/PASSWORD and NIFI_WEB_PROXY_HOST live in the
+          # .env already sitting in $DEPLOY_PATH (the same .env the Python
+          # extractors use) — provisioned once by hand and never touched by
+          # CI. See DEPLOYMENT.md. Only the stack definition and driver jar
+          # are synced. nifi/dead-letter/ is deliberately excluded: it's a
+          # live volume mount with production dead-letter output, not a
+          # deploy artifact. $DEPLOY_PATH is writable by the deploy user only
+          # for these NiFi-owned paths (docker-compose.yml, drivers/, nifi/)
+          # via a shared group — see DEPLOYMENT.md.
           rsync -az \
             -e "ssh -p $SRV_PROD_SSH_PORT" \
             docker-compose.yml \
