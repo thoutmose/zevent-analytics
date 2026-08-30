@@ -101,6 +101,36 @@ jobs:
             drivers/ \
             "$SRV_PROD_USER@$SRV_PROD_HOST:$DEPLOY_PATH/drivers/"
 
+      - name: Sync Python source files
+        # main.py/zevent_api.py/zevent_donation_goals.py run as systemd
+        # services (zevent-*-prod), started independently of this pipeline
+        # (see README.md "Running as a service") but living in the same
+        # checkout DEPLOY_PATH points at. archive_parquet.py/archive_logs.py
+        # run instead off an hourly cron job that just re-execs the file on
+        # disk each time, so syncing them here is the entire fix for those -
+        # no restart step needed. Same --inplace/no-owner etc. reasoning as
+        # docker-compose.yml above: deploy has group write on each of these
+        # files (and sql/, set up the same way as drivers/) but not on
+        # DEPLOY_PATH's top level.
+        env:
+          SRV_PROD_HOST: ${{ secrets.SRV_PROD_HOST }}
+          SRV_PROD_USER: ${{ secrets.SRV_PROD_USER }}
+          SRV_PROD_SSH_PORT: ${{ secrets.SRV_PROD_SSH_PORT || '22' }}
+          DEPLOY_PATH: ${{ vars.SRV_PROD_DEPLOY_PATH || '/opt/twitch-analytics' }}
+        run: |
+          rsync -rz --inplace --no-owner --no-group --no-perms --no-times \
+            -e "ssh -p $SRV_PROD_SSH_PORT" \
+            main.py zevent_api.py zevent_donation_goals.py \
+            nifi_client.py http_config.py logging_setup.py \
+            archive_common.py archive_parquet.py archive_logs.py \
+            pyproject.toml uv.lock logging.yaml \
+            "$SRV_PROD_USER@$SRV_PROD_HOST:$DEPLOY_PATH/"
+
+          rsync -rz --delete --no-owner --no-group --no-perms --no-times \
+            -e "ssh -p $SRV_PROD_SSH_PORT" \
+            sql/ \
+            "$SRV_PROD_USER@$SRV_PROD_HOST:$DEPLOY_PATH/sql/"
+
       - name: Apply stack (docker compose up -d)
         env:
           SRV_PROD_HOST: ${{ secrets.SRV_PROD_HOST }}
@@ -122,7 +152,7 @@ jobs:
             docker compose --env-file .env.nifi up -d --remove-orphans
           "
 
-      - name: Health check
+      - name: NiFi health check
         env:
           SRV_PROD_HOST: ${{ secrets.SRV_PROD_HOST }}
           SRV_PROD_USER: ${{ secrets.SRV_PROD_USER }}
@@ -139,6 +169,50 @@ jobs:
             done
             echo 'NiFi did not come up in time' >&2
             exit 1
+          "
+
+      - name: Refresh deps & restart zevent services
+        # deploy has exactly two sudo grants for this, set up by hand on
+        # srv-prod (see /etc/sudoers.d/twitch-deploy, DEPLOYMENT.md): running
+        # `uv sync` as thoutmose (the venv's owner, and the user these units
+        # run as - see each unit's User= directive) and restarting these
+        # three units as root (required for a system-level unit regardless
+        # of its own User=). Nothing broader than that is granted.
+        env:
+          SRV_PROD_HOST: ${{ secrets.SRV_PROD_HOST }}
+          SRV_PROD_USER: ${{ secrets.SRV_PROD_USER }}
+          SRV_PROD_SSH_PORT: ${{ secrets.SRV_PROD_SSH_PORT || '22' }}
+          DEPLOY_PATH: ${{ vars.SRV_PROD_DEPLOY_PATH || '/opt/twitch-analytics' }}
+        run: |
+          ssh -p "$SRV_PROD_SSH_PORT" "$SRV_PROD_USER@$SRV_PROD_HOST" "
+            set -euo pipefail
+            sudo -u thoutmose /home/thoutmose/.local/bin/uv sync --frozen --directory '$DEPLOY_PATH'
+            sudo systemctl restart zevent-api-prod
+            sudo systemctl restart zevent-donation-goals-prod
+            sudo systemctl restart zevent-main-prod
+          "
+
+      - name: Zevent services health check
+        env:
+          SRV_PROD_HOST: ${{ secrets.SRV_PROD_HOST }}
+          SRV_PROD_USER: ${{ secrets.SRV_PROD_USER }}
+          SRV_PROD_SSH_PORT: ${{ secrets.SRV_PROD_SSH_PORT || '22' }}
+        run: |
+          ssh -p "$SRV_PROD_SSH_PORT" "$SRV_PROD_USER@$SRV_PROD_HOST" "
+            for unit in zevent-api-prod zevent-donation-goals-prod zevent-main-prod; do
+              for i in \$(seq 1 10); do
+                if [ \"\$(systemctl is-active \"\$unit\")\" = 'active' ]; then
+                  echo \"\$unit is active\"
+                  break
+                fi
+                if [ \"\$i\" = 10 ]; then
+                  echo \"\$unit did not become active in time\" >&2
+                  exit 1
+                fi
+                echo \"waiting for \$unit (attempt \$i/10)...\"
+                sleep 5
+              done
+            done
           "
 
       - name: Deploy summary
