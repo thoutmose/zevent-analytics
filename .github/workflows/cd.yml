@@ -79,8 +79,12 @@ jobs:
           # live volume mount with production dead-letter output, not a
           # deploy artifact. $DEPLOY_PATH is writable by the deploy user only
           # for these NiFi-owned paths (docker-compose.yml, drivers/, nifi/)
-          # via a shared group — see DEPLOYMENT.md.
-          rsync -az \
+          # via a shared group — see DEPLOYMENT.md. --inplace: deploy has
+          # write on docker-compose.yml itself but not on $DEPLOY_PATH's top
+          # level (that's thoutmose's checkout root), so rsync's default
+          # write-a-temp-file-then-rename approach fails — it needs write on
+          # the containing directory for that, not just the file.
+          rsync -az --inplace \
             -e "ssh -p $SRV_PROD_SSH_PORT" \
             docker-compose.yml \
             "$SRV_PROD_USER@$SRV_PROD_HOST:$DEPLOY_PATH/docker-compose.yml"
