@@ -1,11 +1,14 @@
 # Deploying to srv-prod
 
 CD ([`.github/workflows/cd.yml`](.github/workflows/cd.yml)) deploys **only
-the NiFi stack** (`docker-compose.yml` + `drivers/`) to srv-prod.
-`main.py`/`zevent_api.py`/`zevent_donation_goals.py` also run on srv-prod for
-the real event (see `README.md`'s "Running as a service"), but aren't
-deployed by this pipeline — that checkout is set up and started the same
-manual, systemd way described there, independent of what CD touches.
+the NiFi stack** (`docker-compose.yml` + `drivers/`) to srv-prod, into the
+same checkout (`~/twitch-analytics-prod`) that
+`main.py`/`zevent_api.py`/`zevent_donation_goals.py` run from for the real
+event (see `README.md`'s "Running as a service"). CD only ever touches the
+NiFi-owned paths in that checkout (`docker-compose.yml`, `drivers/`,
+`nifi/`) — the Python scripts, `.env`, and `.git` are untouched by it, and
+are set up and started the same manual, systemd way described in
+`README.md`, independent of what CD does.
 
 It never runs off a bare `push`: it waits for the `CI` workflow on `main` to
 finish successfully, and then still pauses for a **manual approval** before
@@ -37,9 +40,25 @@ sudo usermod -aG docker deploy   # so `docker compose` works without sudo
 sudo -u deploy mkdir -p /home/deploy/.ssh
 echo "<contents of srv-prod-deploy-key.pub>" | sudo -u deploy tee -a /home/deploy/.ssh/authorized_keys
 sudo chmod 700 /home/deploy/.ssh && sudo chmod 600 /home/deploy/.ssh/authorized_keys
+```
 
-sudo mkdir -p /opt/twitch-analytics/drivers /opt/twitch-analytics/nifi/dead-letter
-sudo chown -R deploy:deploy /opt/twitch-analytics
+`deploy` needs write access to only the NiFi-owned paths inside the
+extractors' checkout (`docker-compose.yml`, `drivers/`, `nifi/`) — not the
+whole checkout, so a compromised deploy key still can't reach `.env`, `.git`,
+or the Python scripts. Do this with a shared group rather than `chown -R`
+the whole directory:
+
+```bash
+# On srv-prod, once ~/twitch-analytics-prod exists (see README.md):
+sudo groupadd twitch-deploy
+sudo usermod -aG twitch-deploy deploy
+sudo usermod -aG twitch-deploy <the user the extractors' checkout belongs to>
+
+cd ~/twitch-analytics-prod
+sudo chgrp -R twitch-deploy docker-compose.yml drivers nifi
+sudo chmod -R g+rwX drivers nifi
+sudo chmod g+rw docker-compose.yml
+sudo chmod g+s drivers nifi   # new files rsync'd in inherit the group
 ```
 
 ### 3. Create the `production` GitHub Environment (the approval gate)
@@ -73,24 +92,26 @@ fine as plain variables):
 
 | Variable | Value |
 |---|---|
-| `SRV_PROD_DEPLOY_PATH` | only if not `/opt/twitch-analytics` |
+| `SRV_PROD_DEPLOY_PATH` | the extractors' checkout, e.g. `/home/thoutmose/twitch-analytics-prod` (only needed if it's not the literal path `/opt/twitch-analytics`) |
 | `SRV_PROD_NIFI_HOSTNAME` | only if not `nifi.thoutmose.me` (cosmetic — shown as the environment URL in the Actions UI) |
 
 ### 5. `.env` on srv-prod
 
 `docker-compose.yml` reads `NIFI_ADMIN_USERNAME`, `NIFI_ADMIN_PASSWORD`, and
-`NIFI_WEB_PROXY_HOST` from a `.env` file next to it. CD deliberately never
-writes this file — create it once, by hand, in `/opt/twitch-analytics/.env`
-on the server, and it'll persist across deploys:
+`NIFI_WEB_PROXY_HOST` from a `.env` file next to it — the same `.env` the
+Python extractors read their own settings from (see README.md), since NiFi
+and the extractors now share one checkout. CD deliberately never writes
+this file — add these three keys to that `.env` once, by hand, and they'll
+persist across deploys:
 
 ```bash
-# On srv-prod, as the deploy user:
-cat > /opt/twitch-analytics/.env <<'EOF'
+# On srv-prod:
+cat >> /home/thoutmose/twitch-analytics-prod/.env <<'EOF'
 NIFI_ADMIN_USERNAME=admin
 NIFI_ADMIN_PASSWORD=<a real password, min 12 chars>
 NIFI_WEB_PROXY_HOST=nifi.thoutmose.me
 EOF
-chmod 600 /opt/twitch-analytics/.env
+chmod 600 /home/thoutmose/twitch-analytics-prod/.env
 ```
 
 ## What the pipeline actually does
@@ -101,8 +122,10 @@ chmod 600 /opt/twitch-analytics/.env
    the `production` environment for a required reviewer to approve it
    (**Actions tab → the waiting run → Review deployments**).
 3. Once approved: `rsync` syncs `docker-compose.yml` and `drivers/` to
-   `$SRV_PROD_DEPLOY_PATH` over SSH (`nifi/dead-letter/` is left alone — it's
-   a live volume mount with production data, not a deploy artifact).
+   `$SRV_PROD_DEPLOY_PATH` (the extractors' checkout) over SSH, writing only
+   to the NiFi-owned paths the `deploy` user has group access to
+   (`nifi/dead-letter/` is left alone either way — it's a live volume mount
+   with production data, not a deploy artifact).
 4. `docker compose pull && docker compose up -d --remove-orphans` on
    srv-prod.
 5. A health check polls `https://localhost:8443/nifi/` on srv-prod for up to
