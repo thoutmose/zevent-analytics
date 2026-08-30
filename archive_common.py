@@ -17,7 +17,7 @@ zstd-compressed and rsync/ssh overhead dominated at scale.
 
 import hashlib
 import logging
-import subprocess
+import subprocess  # nosec B404 - every call below is a static arg list, never shell=True
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -37,7 +37,7 @@ def sha256_local(path: Path) -> str:
 
 
 def _ensure_remote_dir(remote_host: str, remote_path: str) -> bool:
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B603 B607 - remote_host/remote_path are operator config, not user input
         ["ssh", *SSH_MULTIPLEX_ARGS, remote_host, "mkdir", "-p", remote_path],
         capture_output=True,
         text=True,
@@ -62,7 +62,7 @@ def _build_bundle(candidates: list[Path], base_dir: Path, bundle_path: Path) -> 
     relative_names = [str(p.relative_to(base_dir)) for p in candidates]
     _ = filelist_path.write_text("\n".join(relative_names) + "\n")
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 B607 - static arg list, all paths built by this module
             [
                 "tar",
                 "--zstd",
@@ -145,7 +145,7 @@ def run_bundled(
         bundle_size = bundle_path.stat().st_size
         remote_target = f"{remote_path.rstrip('/')}/{bundle_name}"
 
-        rsync_result = subprocess.run(
+        rsync_result = subprocess.run(  # nosec B603 B607 - remote_host/remote_target are operator config, not user input
             [
                 "rsync",
                 "-a",
@@ -166,7 +166,7 @@ def run_bundled(
             )
             return 0, skipped, len(candidates), 0
 
-        ssh_result = subprocess.run(
+        ssh_result = subprocess.run(  # nosec B603 B607 - remote_host/remote_target are operator config, not user input
             ["ssh", *SSH_MULTIPLEX_ARGS, remote_host, "sha256sum", remote_target],
             capture_output=True,
             text=True,
