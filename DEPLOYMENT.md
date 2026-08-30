@@ -1,9 +1,11 @@
 # Deploying to srv-prod
 
 CD ([`.github/workflows/cd.yml`](.github/workflows/cd.yml)) deploys **only
-the NiFi stack** (`docker-compose.yml` + `drivers/`) to srv-prod — matching
-`README.md`'s "srv-prod runs NiFi only". `main.py`/`zevent_api.py` aren't
-deployed by this pipeline; run them wherever/whenever the event needs them.
+the NiFi stack** (`docker-compose.yml` + `drivers/`) to srv-prod.
+`main.py`/`zevent_api.py`/`zevent_donation_goals.py` also run on srv-prod for
+the real event (see `README.md`'s "Running as a service"), but aren't
+deployed by this pipeline — that checkout is set up and started the same
+manual, systemd way described there, independent of what CD touches.
 
 It never runs off a bare `push`: it waits for the `CI` workflow on `main` to
 finish successfully, and then still pauses for a **manual approval** before

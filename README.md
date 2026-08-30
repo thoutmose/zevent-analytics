@@ -25,6 +25,7 @@ of everything along the way.
 
 - [Overview](#overview)
 - [Architecture](#architecture)
+- [Infrastructure](#infrastructure)
 - [Design decisions](#design-decisions)
 - [Reliability mechanisms](#reliability-mechanisms)
 - [Performance](#performance)
@@ -42,6 +43,8 @@ of everything along the way.
 - [Logging](#logging)
 - [Development](#development)
 - [Known limitations](#known-limitations)
+- [Efficiency & stability recommendations](#efficiency--stability-recommendations)
+- [Future data analysis tooling](#future-data-analysis-tooling)
 
 ## Overview
 
@@ -125,8 +128,8 @@ flowchart LR
     PUTDBUP -.via PgBouncer.-> PGB
 ```
 
-`srv-prod` runs NiFi only; PostgreSQL and PgBouncer run on a separate
-`srv-db` and aren't managed by this repo. See
+`srv-prod` runs the prod extractors alongside NiFi; PostgreSQL and PgBouncer
+run on a separate `srv-db` and aren't managed by this repo. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for the deployment topology, the
 reverse-proxy setup, and every deviation from the original design.
 
@@ -180,6 +183,53 @@ color-codes a connection once its queue nears the threshold. A flow
 definition for all of this ships at
 [`flow-templates/zevent-ingest-flow.json`](flow-templates/zevent-ingest-flow.json)
 (see [`ARCHITECTURE.md`](ARCHITECTURE.md) for how to import it).
+
+## Infrastructure
+
+Everything above — three extractors, NiFi routing, the PostgreSQL sink, and
+cold-storage archival — runs on six guests on a single Proxmox host,
+provisioned via cloud-init (`qm`/`pct`) with no Terraform/Ansible layer on
+top. Real LAN addresses aren't listed here, same policy as
+[`ARCHITECTURE.md`](ARCHITECTURE.md#topology) and for the same reason (this
+file is committed to git) — resolve hosts by their Tailscale MagicDNS name.
+
+```mermaid
+flowchart LR
+    subgraph PVE["Proxmox host"]
+        NPM["srv-npm<br/>reverse proxy<br/>LXC · 2 vCPU / 2 GB / 8 GB"]
+        DEV["srv-dev<br/>extractors + dev NiFi<br/>VM · 4 vCPU / 8 GB / 40 GB"]
+        PROD["srv-prod<br/>extractors + prod NiFi<br/>VM · 6 vCPU / 12 GB / 40 GB"]
+        DB["srv-db<br/>PostgreSQL + PgBouncer<br/>VM · 4 vCPU / 8 GB / 100 GB"]
+        SVC["srv-services<br/>cold-storage archive<br/>VM · 6 vCPU / 12 GB / 450 GB"]
+        MON["srv-monitoring<br/>standalone, unused by this repo<br/>LXC · 2 vCPU / 2 GB / 20 GB"]
+    end
+    CD["cd.yml runner<br/>(GitHub Actions)"]
+
+    NPM -- "nifi.thoutmose.me" --> PROD
+    NPM -- "nifi-dev.thoutmose.me" --> DEV
+    PROD == same LAN ==> DB
+    DEV -. Tailscale .-> DB
+    CD -. "Tailscale, deploy" .-> PROD
+    DEV -. "archive_parquet.py / archive_logs.py" .-> SVC
+    PROD -. "archive_parquet.py / archive_logs.py" .-> SVC
+```
+
+| Host | Role | Type | vCPU | RAM | Disk |
+|---|---|---|---|---|---|
+| `srv-dev` | Dev machine — extractors + this repo's checkout + dev NiFi | VM | 4 | 8 GB | 40 GB |
+| `srv-prod` | Prod machine — extractors + this repo's checkout + prod NiFi  | VM | 6 | 12 GB | 40 GB |
+| `srv-db` | PostgreSQL + PgBouncer — not managed by this repo | VM | 4 | 8 GB | 100 GB |
+| `srv-services` | Cold-storage target for [`archive_parquet.py`](archive_parquet.py)/[`archive_logs.py`](archive_logs.py) | VM | 6 | 12 GB | 450 GB |
+| `srv-npm` | Reverse proxy in front of `*.thoutmose.me` | LXC | 2 | 2 GB | 8 GB |
+| `srv-monitoring` | Monitoring stack — standalone, not integrated with this repo | LXC | 2 | 2 GB | 20 GB |
+| **Total** | | | **24** | **44 GB** | **658 GB** |
+
+24 vCPU and 44 GB of RAM, split across 4 VMs and 2 LXC containers on one
+physical box, is the entire footprint for ingesting ~300 channels' live
+chat plus event-wide/donation-goal polling in real time, routing it through
+NiFi, and sinking it to Postgres — see [Performance](#performance) for the
+actual throughput (74 msg/s sustained, ~190 msg/s peak) that footprint
+sustains.
 
 ## Design decisions
 
@@ -303,6 +353,16 @@ multi-channel rewrite:
   between processors has an object/size threshold NiFi enforces natively;
   none have been load-tested against real Zevent traffic yet (see
   [Performance](#performance) below).
+- **Archival, not accumulation** —
+  [`archive_parquet.py`](archive_parquet.py)/[`archive_logs.py`](archive_logs.py)
+  are standalone, cron-run scripts (not part of the always-on extractors):
+  each run bundles every eligible file into one tar.zst archive (see
+  [`archive_common.py`](archive_common.py)), rsyncs that single bundle to
+  `ARCHIVE_REMOTE_HOST`, confirms its sha256 matches the local bundle, and
+  only then deletes the original local files — a transfer failure or hash
+  mismatch leaves every original untouched and the whole batch is simply
+  retried on the next run. `--dry-run` reports what would be archived/
+  deleted without touching anything, given the delete step is irreversible.
 
 ## Performance
 
@@ -321,6 +381,8 @@ restart was needed over the event's full duration.
 ├── main.py                  # multi-channel Twitch extractor (chat + metadata)
 ├── zevent_api.py             # zevent.fr/api/ poller (event-wide snapshot)
 ├── zevent_donation_goals.py   # per-streamer donation goal poller
+├── archive_parquet.py        # moves old local Parquet files to cold storage (cron)
+├── setup_archive.sh          # one-time SSH+cron setup for archive_parquet.py
 ├── nifi_client.py             # shared HTTP push helper (batching, retries-safe)
 ├── logging_setup.py           # loads logging.yaml, picks dev/prod handler profile
 ├── logging.yaml                # rotating file handlers + colored console
@@ -410,11 +472,11 @@ cached in `.tio.tokens.json` so later runs don't need to re-authorize
 ### Running as a service (start/stop)
 
 For a long-running event (Zevent runs ~55h), the three extractors run as
-systemd services on srv-dev rather than a foreground `uv run`. Dev and prod
-are two entirely separate checkouts (`twitch-analytics` and
-`twitch-analytics-prod`), each with its own `.env` — dev's `NIFI_WEBHOOK_URL`
-points at the local dev NiFi (`zevent-dev` database), prod's points at
-srv-prod's NiFi over Tailscale (`zevent` database). Each checkout has its own
+systemd services rather than a foreground `uv run`. Dev and prod are two
+entirely separate checkouts on two separate machines — `twitch-analytics` on
+`srv-dev`, pointing at srv-dev's own local NiFi (`zevent-dev` database), and
+`twitch-analytics-prod` on `srv-prod`, pointing at srv-prod's own local NiFi
+(`zevent` database) — each with its own `.env`. Each checkout has its own
 `.tio.tokens.json`, so each needs its own one-time Twitch device-code
 approval.
 
@@ -439,6 +501,82 @@ sudo systemctl disable zevent-api-prod zevent-donation-goals-prod zevent-main-pr
 All six are `Restart=on-failure` — a crash restarts automatically, a manual
 `stop` does not (until the next reboot, unless also `disable`d).
 
+### Archiving old Parquet files and log backups
+
+[`archive_parquet.py`](archive_parquet.py) and
+[`archive_logs.py`](archive_logs.py) are one-shot maintenance scripts, not
+services — neither is installed or scheduled by anything in this repo on
+its own. Both share the same tar+zstd bundle + verify + delete-on-confirm
+mechanics (see [`archive_common.py`](archive_common.py)) and the same
+`ARCHIVE_REMOTE_HOST`, just different destination directories: every file
+found eligible in one run is bundled into a single dated
+`<prefix>-<timestamp>.tar.zst` archive (e.g.
+`parquet-20260830T085635Z.tar.zst`), transferred as that one file, verified
+by sha256, and only then has its originals deleted locally — real
+cold-storage semantics (one dated bundle per run) rather than many small
+files landing individually, and fewer round trips at scale. The trade-off:
+verification and deletion apply to the whole batch at once, not per file —
+if any step fails, every original in that run's batch is left untouched
+(not just one), to be retried as part of the next run's (larger) batch.
+
+- `archive_parquet.py`: Parquet files older than `ARCHIVE_MIN_AGE_SECONDS`
+  under `PARQUET_OUTPUT_DIR`, to `ARCHIVE_REMOTE_PATH`.
+- `archive_logs.py`: closed/rotated log backups under `logging/` (e.g.
+  `debug.log.3`, `debug.log.3.gz`) — never the active files
+  [`logging.yaml`](logging.yaml)'s handlers are currently writing to — to
+  `ARCHIVE_LOGS_REMOTE_PATH`. There's no age guard here the way Parquet
+  needs one: a rotated backup is immutable from the moment it exists, since
+  `CompressedRotatingFileHandler` never writes to one again.
+
+#### One-time setup (per machine)
+
+Run [`./setup_archive.sh`](setup_archive.sh) once on each machine that will
+run either script (dev box, `srv-prod`, or wherever the extractors actually
+run — see [Running as a service](#running-as-a-service-startstop)). It's
+idempotent — every step checks the current state first, so re-running it (a
+second machine, a key rotation, after pulling a newer version of the
+script) never duplicates anything:
+
+```bash
+./setup_archive.sh
+```
+
+It handles, in order: generating a dedicated SSH key for this purpose if one
+doesn't already exist; adding a `Host srv-services` alias to `~/.ssh/config`
+so `ARCHIVE_REMOTE_HOST=srv-services` (the default in `.env.example`)
+resolves without an explicit `-i` flag anywhere; verifying key-based auth
+actually works; installing both scripts' hourly cron jobs (see
+[Running it](#running-it) below); and a check that warns if a `*-prod`
+checkout's `.env` doesn't have `APP_ENV=production` set (see
+[Logging](#logging)) — everything except the logging check is silent when
+already correctly set up.
+
+The one step it can't do unattended: if the SSH key it generates isn't yet
+authorized on `srv-services`, it prints the exact `ssh-copy-id` command to
+run once (needs some existing way in — an already-authorized key, or a
+one-time password from whoever manages that server) and exits; re-run
+`./setup_archive.sh` afterward to pick up where it left off.
+
+Once SSH access works, `ARCHIVE_REMOTE_PATH` and `ARCHIVE_LOGS_REMOTE_PATH`
+(see [Configuration reference](#configuration-reference)) are each created
+automatically on srv-services the first time their script actually has a
+file to send there — nothing to create manually ahead of time.
+
+#### Running it
+
+`./setup_archive.sh` already installs both of these; shown here for
+reference or to adjust manually:
+
+```bash
+# Keeps each run's candidate set small, which matters for SSH-call overhead
+# — see each script's own module docstring. Logs go through the same
+# logging_setup.py profile (APP_ENV) as the other scripts, so failures also
+# show up in logging/errors.log (until archive_logs.py itself archives that
+# backup, at which point it's on srv-services instead).
+0 * * * * cd /path/to/twitch-analytics && uv run archive_parquet.py >> /dev/null 2>&1
+0 * * * * cd /path/to/twitch-analytics && uv run archive_logs.py >> /dev/null 2>&1
+```
+
 ## Configuration reference
 
 All variables live in `.env` (see [`.env.example`](.env.example) for the
@@ -450,11 +588,16 @@ authoritative, commented list). Highlights:
 | `CHANNELS_PER_IRC_CONNECTION` | `50` | Channels per anonymous IRC connection (sharded across `ceil(n / this)` connections) |
 | `IRC_JOIN_PACING_SECONDS` | `0.5` | Delay between IRC `JOIN`s, to respect Twitch's rate limit |
 | `METADATA_SNAPSHOT_INTERVAL_SECONDS` | `15` | Batched Helix poll interval (all channels, all metadata) |
+| `ROSTER_REFRESH_INTERVAL_SECONDS` | `15` | How often `main.py` re-fetches the roster to pick up new streamers mid-event |
 | `ZEVENT_API_POLL_INTERVAL_SECONDS` | `20` | `zevent.fr/api/` poll interval |
 | `FLUSH_INTERVAL_SECONDS` | `30` | How often buffered rows are flushed to Parquet/NiFi |
 | `MAX_ROWS_PER_PARQUET_FILE` | `100000` | Row cap before a Parquet file rolls over |
 | `PARQUET_COMPRESSION` | `zstd` | Codec passed to `pyarrow.parquet.write_table` |
 | `PARQUET_OUTPUT_DIR` | `data` | Local Parquet landing zone |
+| `ARCHIVE_REMOTE_HOST` | `srv-services` | SSH destination for `archive_parquet.py`/`archive_logs.py` (recommend an `~/.ssh/config` alias) |
+| `ARCHIVE_REMOTE_PATH` | `zevent-parquet-archive` | Remote directory archived Parquet files land in |
+| `ARCHIVE_MIN_AGE_SECONDS` | `600` | Minimum file age before `archive_parquet.py` will archive it |
+| `ARCHIVE_LOGS_REMOTE_PATH` | `zevent-logs-archive` | Remote directory archived log backups land in |
 | `NIFI_WEBHOOK_URL` | *(unset)* | NiFi `ListenHTTP` endpoint; unset = Parquet/stdout only |
 | `APP_ENV` | `development` | Logging profile — see [Logging](#logging) |
 | `NIFI_ADMIN_USERNAME` / `NIFI_ADMIN_PASSWORD` | — | NiFi UI single-user login (docker-compose) |
@@ -532,9 +675,15 @@ stack to srv-prod after CI passes on `main`, gated by manual approval — see
   locally but not (yet, or ever) in Postgres. Failures NiFi does receive
   land in `nifi/dead-letter/` for manual replay; nothing reconciles the two
   sinks automatically.
-- **Roster is fetched once at startup.** If `zevent.fr/api/` adds or
-  removes a streamer mid-event, `main.py` needs a restart to pick it up —
-  no live re-sharding of IRC connections.
+- **Roster additions are live, removals aren't.** `main.py` re-fetches the
+  roster every `ROSTER_REFRESH_INTERVAL_SECONDS` (default 15s) and starts
+  watching any new streamer without a restart (`_roster_refresh_loop`,
+  `_refresh_roster`) — but a streamer that drops out of `zevent.fr/api/` is
+  never un-watched; its IRC connection and Helix polling keep running until
+  the process restarts. Deliberate: a channel missing from one response is
+  far more likely a transient API hiccup than a real withdrawal, and a
+  streamer who actually stopped already shows up as offline via the
+  metadata snapshot.
 - **No raid tracking.** Dropped along with EventSub when the channel count
   made per-channel subscriptions impractical (see [Overview](#overview)).
 - **No donation *count*.** `zevent.fr/api/` exposes cumulative donation
@@ -556,3 +705,63 @@ stack to srv-prod after CI passes on `main`, gated by manual approval — see
   published/versioned API. It could change shape or move without notice;
   `zevent_donation_goals.py` isn't insulated against that beyond normal
   `aiohttp.ClientError` handling.
+
+## Efficiency & stability recommendations
+
+Not implemented — a review of what's genuinely missing, on top of what's
+already covered in [Reliability mechanisms](#reliability-mechanisms) and
+[Known limitations](#known-limitations) above:
+
+- **Local-disk exhaustion isn't monitored.** If `ARCHIVE_REMOTE_HOST`
+  becomes unreachable for an extended stretch, `archive_parquet.py`
+  correctly leaves files in place rather than losing them (see
+  [Reliability mechanisms](#reliability-mechanisms)) — but nothing alerts on
+  `data/` growing unbounded in the meantime. A full local disk silently
+  stops new Parquet writes (and, downstream, new NiFi pushes) rather than
+  failing loudly. Worth a simple disk-usage check (cron or a NiFi/Postgres-
+  side alert) once `archive_parquet.py` is in regular use.
+- **Parquet/Postgres drift has no reconciliation.** Already flagged as a
+  known limitation; concretely, a periodic job comparing Parquet row counts
+  (or `batch_id`s) against `bronze_*` tables would turn "nothing reconciles
+  the two sinks automatically" into a detectable, not just theoretical, gap.
+- **No metrics distinct from log files.** Throughput, dead-letter rate, and
+  reconnect counts (see [Performance](#performance)) are all meant to be
+  pulled from `logging/` and PostgreSQL after the fact — there's no live
+  counter/gauge surface during the event itself, so a developing problem
+  (e.g. a stuck IRC shard) is only visible by tailing logs, not by
+  glancing at a dashboard.
+- **NiFi backpressure and PgBouncer pool sizing are both unverified under
+  real load.** NiFi's per-connection backpressure is already noted as
+  untested; the same applies to PgBouncer's connection pool against the
+  ~190 msg/s peak fan-out estimated in [Reliability
+  mechanisms](#reliability-mechanisms) — neither has been load-tested end
+  to end.
+
+## Future data analysis tooling
+
+A proposition, not an implementation — this repo currently has no
+visualization layer at all; it ends at the `bronze_*` tables in PostgreSQL
+on `srv-db` (managed outside this repo, see
+[ARCHITECTURE.md](ARCHITECTURE.md)), plus the Parquet copy now also fed
+into cold storage by `archive_parquet.py`. The main risk for any future
+analysis tool is naively loading "all the data" into memory client-side
+(a browser tab, a `pandas.read_parquet` glob, an unpaginated dashboard
+query) instead of pushing aggregation down to where the data already lives:
+
+- **Ad-hoc analysis: DuckDB.** Its `postgres_scanner` extension can query
+  `bronze_*` directly with no ETL step, and it can also query the archived
+  Parquet files (locally, or over `httpfs`/an SSH-mounted path) without
+  materializing them fully in memory — columnar, with predicate/projection
+  pushdown. This is the natural tool for one-off exploration after the
+  event, against either sink.
+- **Interactive/scripted analysis: Polars.** Prefer a `LazyFrame` pipeline
+  (filter/aggregate, `.collect()` only at the end) over
+  `pandas.read_parquet()` on a whole directory glob, which forces the full
+  dataset into memory up front regardless of how much of it the analysis
+  actually needs.
+- **A dashboard, if one is built:** either Streamlit/Evidence reading
+  cached, already-aggregated DuckDB/Postgres queries (never a raw
+  `SELECT *` bound to page load), or a no-code BI tool (Grafana/Metabase)
+  pointed straight at Postgres — consistent with Postgres already being the
+  source of truth outside this repo, rather than re-deriving one from
+  Parquet.
