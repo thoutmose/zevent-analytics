@@ -1,0 +1,30 @@
+# Safe to commit: every value is env_var(), no literal credentials. Reuses
+# the exact same variable names this repo's own .env already defines for
+# PutDatabaseRecord's DBCPConnectionPool (see ARCHITECTURE.md) — export your
+# existing .env before running dbt (e.g. `set -a; source .env; set +a`) and
+# no separate dbt-specific credentials file is needed.
+#
+# Run dbt from this directory, or pass --profiles-dir . / set
+# DBT_PROFILES_DIR — dbt does not look inside a project's own folder for
+# profiles.yml by default.
+zevent_analytics:
+  target: "{{ env_var('DBT_TARGET', 'dev') }}"
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST') }}"
+      port: "{{ env_var('PGBOUNCER_PORT', '5432') | int }}"
+      user: "{{ env_var('POSTGRES_USER') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD') }}"
+      dbname: "{{ env_var('POSTGRES_DB', 'zevent-dev') }}"
+      schema: public
+      threads: 4
+    prod:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST') }}"
+      port: "{{ env_var('PGBOUNCER_PORT', '5432') | int }}"
+      user: "{{ env_var('POSTGRES_USER') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD') }}"
+      dbname: "{{ env_var('POSTGRES_DB', 'zevent') }}"
+      schema: public
+      threads: 4

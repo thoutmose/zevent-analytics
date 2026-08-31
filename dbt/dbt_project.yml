@@ -1,0 +1,42 @@
+name: "zevent_analytics"
+version: "1.0.0"
+config-version: 2
+
+profile: "zevent_analytics"
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# See macros/generate_schema_name.sql: models land in a schema named exactly
+# after the folder below (stg/int/marts), not <target_schema>_<folder> —
+# this repo's Postgres already has those three schemas provisioned.
+models:
+  zevent_analytics:
+    staging:
+      +schema: stg
+      +materialized: view
+    intermediate:
+      +schema: int
+      +materialized: table
+    marts:
+      +schema: marts
+      +materialized: table
+
+# Chatter profile buckets (mart_chatters__profile) — a judgment call, not a
+# Twitch-defined category, so kept as vars rather than hardcoded in the SQL:
+# sedentaire = exactly 1 channel all event; multi_streamer = a "home" channel
+# plus a handful of others; semi_nomade/nomade scale up from there. Tune here,
+# not in the model.
+vars:
+  chatter_profile_sedentaire_max_channels: 1
+  chatter_profile_multi_streamer_max_channels: 3
+  chatter_profile_semi_nomade_max_channels: 10
+  # int_chat__message_transitions: max gap between two messages in different
+  # channels for it to count as one inferred channel-hop, not two unrelated
+  # sessions. A judgment call, same as the chatter-profile thresholds above.
+  chatter_migration_max_gap_minutes: 30
