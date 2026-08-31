@@ -1,0 +1,114 @@
+version: 2
+
+models:
+  - name: int_donations__streamer_deltas
+    description: Per-streamer donation velocity between consecutive zevent.fr/api/ snapshots.
+    columns:
+      - name: donation_delta_eur
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              arguments:
+                min_value: 0
+              config:
+                severity: warn
+
+  - name: int_chat__hourly_channel_activity
+    description: Chat message/unique-chatter volume per channel per hour.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - channel
+              - hour_bucket
+
+  - name: int_chat__chatter_channel_activity
+    description: All-time message count per (chatter, channel) — feeds the leaderboard and chatter profile.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - chatter_id
+              - channel
+
+  - name: int_community__hourly_chatter_streamer_edges
+    description: Bipartite chatter<->streamer edges, weighted by message count, per hour.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - chatter_id
+              - channel
+              - hour_bucket
+
+  - name: int_chat__emote_usage
+    description: Emote usage counts per (channel, hour, service, emote) — native Twitch + third-party token-matched.
+    columns:
+      - name: service
+        tests:
+          - accepted_values:
+              arguments:
+                values: ["twitch", "7tv", "bttv", "ffz"]
+
+  - name: int_streams__hourly_viewership
+    description: Viewer count per channel per hour.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - channel
+              - hour_bucket
+
+  - name: int_streams__sessions
+    description: One row per actual broadcast (grouped on stream_started_at), not per poll.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - channel
+              - stream_started_at
+
+  - name: int_streams__category_changes
+    description: One row per detected category/title switch while live.
+
+  - name: int_chat__chatter_activity
+    description: One row per chatter, event-wide — identity + lifetime aggregates.
+    columns:
+      - name: chatter_id
+        tests:
+          - unique
+          - not_null
+
+  - name: int_chat__chatter_daily_activity
+    description: Chatter x day grain — feeds retention and new-vs-returning marts.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - chatter_id
+              - day_bucket
+
+  - name: int_chat__inter_arrival
+    description: Gap between one chatter's consecutive messages, any channel — bot-signal input.
+
+  - name: int_chat__message_transitions
+    description: Inferred channel-hops — consecutive messages from the same chatter in two different channels within a short window.
+
+  - name: int_community__channel_pair_jaccard
+    description: Event-wide channel-to-channel audience overlap (Jaccard index on shared chatters).
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - channel_a
+              - channel_b
+
+  - name: int_streams__concurrency
+    description: How many channels were live at each hour, event-wide.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - hour_bucket
+
+  - name: int_donations__leaderboard_rank
+    description: Each streamer's donation-total rank at every snapshot, plus rank change from their previous snapshot.

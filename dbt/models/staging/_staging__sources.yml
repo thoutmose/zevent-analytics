@@ -1,0 +1,115 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: >
+      Raw NiFi-landed tables in `public`, fed by main.py (IRC + Helix),
+      zevent_api.py, zevent_donation_goals.py, and emote_catalog.py — see
+      ../../../ARCHITECTURE.md and README.md's "Data model" section. Not a
+      separate `raw` schema: bronze_* lives directly in `public` in this
+      project.
+    schema: public
+    tables:
+      - name: bronze_live_chat
+        description: One row per chat message, any channel (main.py, IRC).
+        columns:
+          - name: id
+            tests:
+              - unique
+              - not_null
+          - name: channel
+            tests:
+              - not_null
+          - name: chatter_id
+          - name: badges
+            description: "{badge_name: value} parsed from the IRC badges tag."
+          - name: emotes
+            description: "{emote_id: occurrence_count}, native Twitch emotes only — see stg_bronze__emote_catalog for third-party emotes."
+        tests:
+          - dbt_utils.unique_combination_of_columns:
+              arguments:
+                combination_of_columns:
+                - batch_id
+                - row_number
+
+      - name: bronze_metadata_snapshots
+        description: One row per channel per metadata poll (main.py, Helix).
+        columns:
+          - name: id
+            tests:
+              - unique
+              - not_null
+          - name: channel
+            tests:
+              - not_null
+        tests:
+          - dbt_utils.unique_combination_of_columns:
+              arguments:
+                combination_of_columns:
+                - batch_id
+                - row_number
+
+      - name: bronze_zevent_snapshots
+        description: One row per event-wide poll, `streamers` as a nested JSONB array (zevent_api.py).
+        columns:
+          - name: id
+            tests:
+              - unique
+              - not_null
+        tests:
+          - dbt_utils.unique_combination_of_columns:
+              arguments:
+                combination_of_columns:
+                - batch_id
+                - row_number
+
+      - name: bronze_donation_goals
+        description: >
+          Latest-state (UPSERT), not a history — one row per current
+          (participation_id, goal_id) (zevent_donation_goals.py).
+        columns:
+          - name: participation_id
+            tests:
+              - not_null
+          - name: goal_id
+            tests:
+              - not_null
+        tests:
+          - dbt_utils.unique_combination_of_columns:
+              arguments:
+                combination_of_columns:
+                - participation_id
+                - goal_id
+
+      - name: bronze_emote_catalog
+        description: >
+          Latest-state (UPSERT) emote catalog — Twitch/7TV/BetterTTV/
+          FrankerFaceZ, global + per-channel (emote_catalog.py). `channel` is
+          the '__global__' sentinel for scope='global' rows, never NULL.
+        columns:
+          - name: service
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ["twitch", "7tv", "bttv", "ffz"]
+          - name: scope
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ["global", "channel"]
+          - name: channel
+            tests:
+              - not_null
+          - name: emote_code
+            tests:
+              - not_null
+        tests:
+          - dbt_utils.unique_combination_of_columns:
+              arguments:
+                combination_of_columns:
+                - service
+                - scope
+                - channel
+                - emote_id

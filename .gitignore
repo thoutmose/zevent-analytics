@@ -12,7 +12,15 @@ wheels/
 # Secrets and local Twitch auth cache
 .env
 .env.nifi
+.env.postgres
 .tio.tokens.json
+
+# dbt build artifacts (dbt/dbt_project.yml sets clean-targets to these two)
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+# dbt CLI's local anonymous-usage-stats id, regenerated per machine
+dbt/.user.yml
 
 # Parquet output landing zone (one file per chat message/metadata snapshot)
 data/
