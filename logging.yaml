@@ -88,7 +88,7 @@ handlers:
 # root is intentionally left without handlers here — logging_setup.setup_logging()
 # fills root.handlers/root.level from the matching profile below (selected via
 # APP_ENV) before calling dictConfig. Every logger in this project (zevent_extractor,
-# nifi_client, zevent_api, zevent_donation_goals, twitchio.*) propagates up to root
+# nifi_client, zevent_api, zevent_donation_goals, emote_catalog, twitchio.*) propagates up to root
 # by default, so this is what actually determines where their output goes.
 root:
   level: NOTSET
