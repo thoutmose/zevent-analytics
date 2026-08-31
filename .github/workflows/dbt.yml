@@ -1,0 +1,67 @@
+name: dbt (manual)
+
+# Deliberately workflow_dispatch ONLY — no push, no pull_request, no
+# schedule trigger, and no workflow_run chaining off CI or CD. A deploy
+# landing new dbt/ models on srv-prod (see cd.yml's "Sync Python source
+# files" step) does not, by itself, rebuild anything here — someone has to
+# come to the Actions tab and click "Run workflow" every time. That's
+# intentional: dbt transforms data that's continuously landing regardless of
+# whether a deploy just happened, so there's no natural "this commit implies
+# a rebuild" trigger the way there is for CD's own steps.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never let two dbt runs race each other against the same target schemas.
+  group: dbt-srv-prod
+  cancel-in-progress: false
+
+jobs:
+  dbt:
+    name: Run dbt build on srv-prod
+    runs-on: ubuntu-latest
+    steps:
+      - name: Join Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Load deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SRV_PROD_SSH_KEY }}
+
+      - name: Pin known host key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.SRV_PROD_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: dbt deps + build
+        # No new GitHub secrets: reuses the same SSH access CD already has.
+        # run_dbt.sh (synced by cd.yml, run as thoutmose via a sudoers grant
+        # — see DEPLOYMENT.md) does the actual work against whatever dbt/ +
+        # sql/ are currently on disk there, i.e. whatever the last CD deploy
+        # landed — this workflow does not sync anything itself.
+        env:
+          SRV_PROD_HOST: ${{ secrets.SRV_PROD_HOST }}
+          SRV_PROD_USER: ${{ secrets.SRV_PROD_USER }}
+          SRV_PROD_SSH_PORT: ${{ secrets.SRV_PROD_SSH_PORT || '22' }}
+          DEPLOY_PATH: ${{ vars.SRV_PROD_DEPLOY_PATH || '/opt/twitch-analytics' }}
+        run: |
+          ssh -p "$SRV_PROD_SSH_PORT" "$SRV_PROD_USER@$SRV_PROD_HOST" \
+            "sudo -u thoutmose '$DEPLOY_PATH/run_dbt.sh'"
+
+      - name: Run summary
+        if: always()
+        run: |
+          {
+            echo "### dbt build on srv-prod"
+            echo "- Triggered by: ${{ github.actor }} (manual)"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
