@@ -28,7 +28,7 @@
         },
         "properties": {
           "Routing Strategy": "Route to Property name",
-          "upsert": "${stream:equals('donation_goals')}",
+          "upsert": "${stream:in('donation_goals', 'emote_catalog')}",
           "insert": "${stream:in('live_chat', 'metadata', 'zevent_snapshot')}"
         },
         "propertyDescriptors": {
@@ -636,9 +636,9 @@
           "rollback-on-failure": "false",
           "put-db-record-statement-type": "UPSERT",
           "db-type": "PostgreSQL",
-          "put-db-record-update-keys": "participation_id, goal_id",
+          "put-db-record-update-keys": "${stream:equals('donation_goals'):ifElse('participation_id, goal_id', 'service, scope, channel, emote_id')}",
           "put-db-record-quoted-identifiers": "false",
-          "put-db-record-table-name": "bronze_donation_goals",
+          "put-db-record-table-name": "${stream:equals('donation_goals'):ifElse('bronze_donation_goals', 'bronze_emote_catalog')}",
           "put-db-record-unmatched-field-behavior": "Ignore Unmatched Fields",
           "put-db-record-max-batch-size": "1000",
           "put-db-record-record-reader": "10d24f39-1dab-332f-b74c-f03dade6d69d",
