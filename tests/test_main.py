@@ -52,6 +52,35 @@ def test_privmsg_re_does_not_match_non_privmsg_line():
     assert main.PRIVMSG_RE.match(line) is None
 
 
+def test_parse_badges_parses_multiple_badges():
+    assert main._parse_badges("moderator/1,subscriber/12") == {
+        "moderator": "1",
+        "subscriber": "12",
+    }
+
+
+def test_parse_badges_handles_none_and_empty():
+    assert main._parse_badges(None) == {}
+    assert main._parse_badges("") == {}
+
+
+def test_parse_badges_ignores_malformed_entries():
+    assert main._parse_badges("vip/1,malformed") == {"vip": "1"}
+
+
+def test_parse_emotes_counts_occurrences():
+    assert main._parse_emotes("25:0-4,12-16/1902:6-10") == {"25": 2, "1902": 1}
+
+
+def test_parse_emotes_handles_none_and_empty():
+    assert main._parse_emotes(None) == {}
+    assert main._parse_emotes("") == {}
+
+
+def test_parse_emotes_single_occurrence():
+    assert main._parse_emotes("354:0-3") == {"354": 1}
+
+
 def test_batch_parquet_writer_flush_is_noop_on_empty_buffer(tmp_path: Path):
     writer = main.BatchParquetWriter(tmp_path, "test", max_rows=10)
     writer.flush()
