@@ -32,6 +32,7 @@ isn't cancelled mid-send.
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -74,6 +75,14 @@ METADATA_SNAPSHOT_INTERVAL_SECONDS: int = int(
 ROSTER_REFRESH_INTERVAL_SECONDS: int = int(
     os.environ.get("ROSTER_REFRESH_INTERVAL_SECONDS", "15")
 )
+# How often unresolved chatter_ids are looked up via Helix Get Users (batched,
+# HELIX_BATCH_SIZE per call) to fill in account_created_at/broadcaster_type.
+# These don't change message to message like the IRC-tag-derived badges/
+# user_type do, so they're cached in memory per chatter_id rather than
+# looked up on every message — see ZeventBot._chatter_lookup_loop.
+CHATTER_LOOKUP_INTERVAL_SECONDS: int = int(
+    os.environ.get("CHATTER_LOOKUP_INTERVAL_SECONDS", "30")
+)
 
 # Twitch caps both "get streams" and "get users" at 100 login/id values per call.
 HELIX_BATCH_SIZE: int = 100
@@ -105,6 +114,44 @@ PARQUET_COMPRESSION: str = os.environ.get("PARQUET_COMPRESSION", "zstd")
 def _chunked(items: list[str], size: int) -> list[list[str]]:
     """Splits items into consecutive slices of at most `size` elements each."""
     return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _parse_badges(raw: str | None) -> dict[str, str]:
+    """Parses an IRC `badges` tag ("moderator/1,subscriber/12") into a dict.
+
+    Twitch encodes a chatter's roles/status (broadcaster, staff, admin,
+    moderator, vip, artist, founder, subscriber, partner, turbo, premium,
+    no_audio, no_video, ...) as this one comma-separated tag rather than
+    fixed IRC fields — parsed generically here, not as one flag per known
+    badge, so a badge Twitch adds or renames later shows up automatically
+    instead of needing a schema change.
+    """
+    if not raw:
+        return {}
+    return dict(pair.split("/", 1) for pair in raw.split(",") if "/" in pair)
+
+
+def _parse_emotes(raw: str | None) -> dict[str, int]:
+    """Parses an IRC `emotes` tag ("25:0-4,12-16/1902:6-10") into an
+    {emote_id: occurrence_count} dict.
+
+    Only covers native Twitch emotes — Twitch's own tag is the only emote
+    signal IRC carries. Third-party emotes (7TV/BTTV/FFZ) are plain text in
+    message_text with no tag at all; matching those against a fetched
+    catalog is a dbt-side join (see emote_catalog.py), not something this
+    parser can see.
+    """
+    if not raw:
+        return {}
+    counts: dict[str, int] = {}
+    for entry in raw.split("/"):
+        emote_id, _, positions = entry.partition(":")
+        if not positions:
+            continue
+        occurrences = len([p for p in positions.split(",") if p])
+        if occurrences:
+            counts[emote_id] = occurrences
+    return counts
 
 
 class BatchParquetWriter:
@@ -173,6 +220,18 @@ class ChannelStats:
     stream_ended_at: str | None = None
     chat_message_count: int = 0
     messages_per_chatter: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class ChatterInfo:
+    """Twitch account facts for one chatter_id, resolved once via Helix Get
+    Users and reused for every subsequent message from that chatter (see
+    ZeventBot.chatter_cache) — unlike badges/user_type, these don't change
+    message to message.
+    """
+
+    created_at: datetime
+    broadcaster_type: str
 
 
 class ChatConnection:
@@ -253,6 +312,9 @@ class ChatConnection:
                             tags.get("user-id"),
                             tags.get("tmi-sent-ts"),
                             match["text"],
+                            tags.get("badges"),
+                            tags.get("user-type"),
+                            tags.get("emotes"),
                         )
 
 
@@ -268,6 +330,10 @@ class ZeventBot(commands.Bot):
         self.metadata_writer: BatchParquetWriter = BatchParquetWriter(
             METADATA_DIR, "metadata"
         )
+        # Populated by _chatter_lookup_loop; chatter_ids seen in chat but not
+        # yet in chatter_cache land in _unresolved_chatter_ids until then.
+        self.chatter_cache: dict[str, ChatterInfo] = {}
+        self._unresolved_chatter_ids: set[str] = set()
         # asyncio only holds a *weak* reference to a task returned by
         # create_task() — an unreferenced one can be garbage-collected mid-run
         # (see event_ready below). Keeping strong refs here, the same pattern
@@ -323,6 +389,7 @@ class ZeventBot(commands.Bot):
         self._spawn_background(self._metadata_snapshot_loop())
         self._spawn_background(self._flush_loop())
         self._spawn_background(self._roster_refresh_loop())
+        self._spawn_background(self._chatter_lookup_loop())
         LOGGER.info(
             "Watching %d channels across %d IRC connection(s)",
             len(self.channels),
@@ -347,6 +414,9 @@ class ZeventBot(commands.Bot):
         chatter_id: str | None,
         sent_ts_ms: str | None,
         text: str,
+        badges: str | None,
+        user_type: str | None,
+        emotes: str | None,
     ) -> None:
         """Records one chat message against its channel's stats and buffers
         it for writing.
@@ -371,6 +441,10 @@ class ZeventBot(commands.Bot):
             stats.messages_per_chatter.get(chatter, 0) + 1
         )
 
+        chatter_info = self.chatter_cache.get(chatter_id) if chatter_id else None
+        if chatter_id and chatter_info is None:
+            self._unresolved_chatter_ids.add(chatter_id)
+
         self.chat_writer.add(
             {
                 "channel": stats.channel,
@@ -379,6 +453,13 @@ class ZeventBot(commands.Bot):
                 "message_text": text,
                 "message_sent_at": message_sent_at,
                 "captured_at": now,
+                "badges": json.dumps(_parse_badges(badges), ensure_ascii=False),
+                "user_type": user_type,
+                "emotes": json.dumps(_parse_emotes(emotes), ensure_ascii=False),
+                "account_created_at": chatter_info.created_at if chatter_info else None,
+                "broadcaster_type": chatter_info.broadcaster_type
+                if chatter_info
+                else None,
             }
         )
 
@@ -457,6 +538,37 @@ class ZeventBot(commands.Bot):
                 LOGGER.exception(
                     "Metadata snapshot poll failed, retrying next interval"
                 )
+
+    async def _chatter_lookup_loop(self) -> None:
+        """Resolves account_created_at/broadcaster_type for every chatter_id
+        in _unresolved_chatter_ids, every CHATTER_LOOKUP_INTERVAL_SECONDS.
+
+        A chatter's first few messages (before this loop's next tick, or
+        before the lookup returns) land with these two columns null; every
+        message after that is filled in from chatter_cache. Same broad
+        except/log/retry-next-tick pattern as _metadata_snapshot_loop: one
+        Helix hiccup shouldn't stop this for the rest of the run, and any
+        chatter_id not resolved this pass (including one Get Users didn't
+        return, e.g. a deleted account) just stays pending for the next.
+        """
+        while True:
+            await asyncio.sleep(CHATTER_LOOKUP_INTERVAL_SECONDS)
+            if not self._unresolved_chatter_ids:
+                continue
+            try:
+                for chunk in _chunked(
+                    list(self._unresolved_chatter_ids), HELIX_BATCH_SIZE
+                ):
+                    ids: list[int | str] = list(chunk)
+                    for user in await self.fetch_users(ids=ids):
+                        chatter_id = str(user.id)
+                        self.chatter_cache[chatter_id] = ChatterInfo(
+                            created_at=user.created_at,
+                            broadcaster_type=user.broadcaster_type,
+                        )
+                        self._unresolved_chatter_ids.discard(chatter_id)
+            except Exception:
+                LOGGER.exception("Chatter lookup failed, retrying next interval")
 
     async def _roster_refresh_loop(self) -> None:
         """Re-fetches the Zevent roster every ROSTER_REFRESH_INTERVAL_SECONDS
