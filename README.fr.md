@@ -11,6 +11,7 @@
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-4169E1?logo=postgresql&logoColor=white)
 ![PgBouncer](https://img.shields.io/badge/PgBouncer-connection%20pooling-4169E1)
 ![Docker Compose](https://img.shields.io/badge/Docker%20Compose-NiFi%20stack-2496ED?logo=docker&logoColor=white)
+![dbt](https://img.shields.io/badge/dbt-transformation-FF694B?logo=dbt&logoColor=white)
 ![Ruff](https://img.shields.io/badge/lint%20%2F%20format-Ruff-D7FF64?logo=ruff&logoColor=black)
 ![ty](https://img.shields.io/badge/type%20check-ty-FCA121)
 [![CI](https://github.com/thoutmose/zevent-analytics/actions/workflows/ci.yml/badge.svg)](https://github.com/thoutmose/zevent-analytics/actions/workflows/ci.yml)
@@ -19,9 +20,11 @@
 
 Extrait les données en direct de chaque chaîne Twitch participant au
 [Zevent](https://zevent.fr/) — chat, nombre de viewers, métadonnées de
-stream, et le flux de dons/streamers de l'événement lui-même — et les
-dépose dans une couche bronze PostgreSQL via un pipeline d'ingestion Apache
-NiFi, avec une copie locale Parquet de tout, en parallèle.
+stream, catalogues d'emotes, et le flux de dons/streamers de l'événement
+lui-même — et les dépose dans une couche bronze PostgreSQL via un pipeline
+d'ingestion Apache NiFi, avec une copie locale Parquet de tout, en
+parallèle. Une couche de transformation dbt (`stg`/`int`/`marts`)
+transforme ensuite cette couche bronze en surface d'analyse.
 
 ## Table des matières
 
@@ -46,26 +49,40 @@ NiFi, avec une copie locale Parquet de tout, en parallèle.
 - [Développement](#développement)
 - [Limitations connues](#limitations-connues)
 - [Recommandations d'efficacité et de stabilité](#recommandations-defficacité-et-de-stabilité)
-- [Outillage d'analyse de données futur](#outillage-danalyse-de-données-futur)
+- [Transformation des données (dbt)](#transformation-des-données-dbt)
+- [Qualité des données](#qualité-des-données)
+- [Analyse des données](#analyse-des-données)
 
 ## Aperçu
 
-Trois extracteurs indépendants alimentent le même pipeline :
+Quatre extracteurs indépendants alimentent le même pipeline :
 
 | Script | Surveille | Source | Authentification |
 |---|---|---|---|
 | [`main.py`](main.py) | Toutes les chaînes de la liste Zevent en cours (300+) | Twitch Helix (polling par lots) + IRC anonyme (connexions shardées) | Device Code Flow, app-only |
 | [`zevent_api.py`](zevent_api.py) | L'événement dans son ensemble | [`zevent.fr/api/`](https://zevent.fr/api/), public/non authentifié | aucune |
 | [`zevent_donation_goals.py`](zevent_donation_goals.py) | Les objectifs de dons de chaque streamer | `api.ppr.evenmorestats.fr` (le backend JSON derrière [`zevent.gdoc.fr/participations`](https://zevent.gdoc.fr/participations), public/non authentifié) | aucune |
+| [`emote_catalog.py`](emote_catalog.py) | Le catalogue d'emotes de chaque chaîne, plus l'ensemble global de chaque service | Twitch Helix + [7TV](https://7tv.io/), [BetterTTV](https://betterttv.com/), [FrankerFaceZ](https://www.frankerfacez.com/) | Twitch : app-only ; les services tiers sont publics/non authentifiés |
 
-Les trois poussent leurs lots vers un flow [Apache NiFi](https://nifi.apache.org/)
+Les quatre poussent leurs lots vers un flow [Apache NiFi](https://nifi.apache.org/)
 en HTTP (`NIFI_WEBHOOK_URL`) qui route, découpe et écrit dans PostgreSQL —
 voir [`ARCHITECTURE.md`](ARCHITECTURE.md) pour la justification complète de
 la conception (batching, backpressure, idempotence, dead-lettering). Si
-elle n'est pas définie, les trois scripts fonctionnent quand même seuls —
-`main.py` écrit ses fichiers Parquet localement, les deux autres écrivent
+elle n'est pas définie, les quatre scripts fonctionnent quand même seuls —
+`main.py` écrit ses fichiers Parquet localement, les trois autres écrivent
 aussi leur checkpoint local — NiFi est une sortie additive, pas une
 dépendance dure.
+
+`emote_catalog.py` récupère des *catalogues* d'emotes (quels codes
+d'emotes existent, par chaîne/globalement), pas leur usage — il existe
+parce que le tag IRC `emotes` de Twitch (capturé directement par `main.py`,
+voir `bronze_live_chat.emotes` plus bas) ne couvre que les emotes natives
+Twitch. 7TV/BetterTTV/FrankerFaceZ sont des surcouches côté client
+d'extensions de chat que l'IRC/API de Twitch ignore totalement : un message
+qui en utilise une est juste un token en texte brut (par ex. `monkaS`) sans
+aucun tag. Faire correspondre ce token au catalogue tiers réel d'une chaîne
+est une jointure côté dbt contre `bronze_emote_catalog`, pas quelque chose
+que la partie Python de ce dépôt calcule.
 
 `main.py` ne cible plus une seule chaîne codée en dur : il récupère la
 liste actuelle des streamers Zevent depuis `zevent.fr/api/` au démarrage et
@@ -83,12 +100,14 @@ flowchart LR
         TW["Twitch<br/>(Helix + IRC anonyme)"]
         ZV["zevent.fr/api/"]
         DGAPI["api.ppr.evenmorestats.fr<br/>(backend de zevent.gdoc.fr)"]
+        EMOTEAPIS["Twitch Helix + 7TV +<br/>BetterTTV + FrankerFaceZ"]
     end
 
     subgraph "Extracteurs Python"
         MAIN["main.py<br/>(IRC shardé + polling Helix par lots)"]
         ZAPI["zevent_api.py<br/>(snapshot de tout l'événement)"]
         DGOAL["zevent_donation_goals.py<br/>(liste d'objectifs par streamer)"]
+        ECAT["emote_catalog.py<br/>(catalogues d'emotes par chaîne + globaux)"]
     end
 
     subgraph "Zone de dépôt locale"
@@ -102,7 +121,7 @@ flowchart LR
         ROUTE["RouteOnAttribute"]
         SPLIT["SplitJson<br/>(lignes → 1 flowfile chacune)"]
         PUTDB["PutDatabaseRecord<br/>(INSERT, bronze_live_chat/<br/>metadata_snapshots/zevent_snapshots)"]
-        PUTDBUP["PutDatabaseRecord<br/>(UPSERT, bronze_donation_goals)"]
+        PUTDBUP["PutDatabaseRecord<br/>(UPSERT, bronze_donation_goals/<br/>emote_catalog)"]
         DEADLETTER[("PutFile<br/>dead-letter")]
     end
 
@@ -115,13 +134,16 @@ flowchart LR
     ZV --> ZAPI
     ZV -.liste au démarrage.-> MAIN
     DGAPI --> DGOAL
+    EMOTEAPIS --> ECAT
+    ZV -.liste au démarrage.-> ECAT
     MAIN --> PARQUET
     MAIN -- NIFI_WEBHOOK_URL --> LISTEN
     ZAPI -- NIFI_WEBHOOK_URL --> LISTEN
     DGOAL -- NIFI_WEBHOOK_URL --> LISTEN
+    ECAT -- NIFI_WEBHOOK_URL --> LISTEN
     LISTEN --> EJP --> MERGE --> ROUTE --> SPLIT
-    SPLIT -- stream != donation_goals --> PUTDB
-    SPLIT -- stream == donation_goals --> PUTDBUP
+    SPLIT -- "stream in (donation_goals, emote_catalog)" --> PUTDBUP
+    SPLIT -- tout autre stream --> PUTDB
     PUTDB -- succès --> PG
     PUTDB -- échec --> DEADLETTER
     PUTDBUP -- succès --> PG
@@ -144,20 +166,20 @@ conception d'origine.
 Une capture en direct du flow ci-dessus (instance de dev) — les chiffres
 sur chaque processeur sont des statistiques glissantes sur 5 minutes, pas
 des étiquettes fixes. De gauche à droite, voici le chemin d'ingestion que
-prend chaque lot des trois extracteurs :
+prend chaque lot des quatre extracteurs :
 
 1. **`ListenHTTP`** — le point d'entrée d'ingestion (`NIFI_WEBHOOK_URL`).
    Chaque POST est une seule enveloppe de lot complète et autonome
    (`batch_id`, `stream`, `rows[]`) issue d'un appel
    `nifi_client.push_batch` — il n'y a rien à corréler entre requêtes.
 2. **`EvaluateJsonPath`** — promeut le champ `$.stream` de l'enveloppe
-   (`live_chat` / `metadata` / `zevent_snapshot` / `donation_goals`) en
-   attribut du flowfile, pour que l'étape suivante puisse router sans
-   reparser le corps à chaque saut.
+   (`live_chat` / `metadata` / `zevent_snapshot` / `donation_goals` /
+   `emote_catalog`) en attribut du flowfile, pour que l'étape suivante
+   puisse router sans reparser le corps à chaque saut.
 3. **`RouteOnAttribute`** — le seul point de branchement du flow, sur cet
    attribut `stream` : `insert` (les trois flux append-only), `upsert`
-   (`donation_goals`, le seul flux qui écrase en place), ou `unmatched`
-   pour le reste.
+   (`donation_goals` et `emote_catalog`, les deux flux qui écrasent en
+   place), ou `unmatched` pour le reste.
 4. **`SplitJson`** (un par branche) — développe le tableau `rows[]` de
    l'enveloppe en un flowfile par ligne. Chaque ligne porte déjà son propre
    `batch_id` + `row_number` (défini côté Python, voir `nifi_client.py`) —
@@ -167,9 +189,10 @@ prend chaque lot des trois extracteurs :
    choisit sa table cible (`bronze_live_chat` / `bronze_metadata_snapshots`
    / `bronze_zevent_snapshots`) via un ternaire NiFi Expression Language
    sur l'attribut `stream`, si bien qu'un seul processeur couvre trois
-   tables au lieu de trois quasi identiques. La branche UPSERT écrit
-   toujours dans `bronze_donation_goals` avec
-   `Update Keys = participation_id, goal_id`.
+   tables au lieu de trois quasi identiques. La branche UPSERT fait la même
+   chose entre ses deux tables : `bronze_donation_goals`
+   (`Update Keys = participation_id, goal_id`) ou `bronze_emote_catalog`
+   (`Update Keys = service, scope, channel, emote_id`).
 6. **`UpdateAttribute`** — chaque chemin d'échec du flow (`EvaluateJsonPath`
    qui échoue sur du JSON invalide, `unmatched` de `RouteOnAttribute`, l'un
    ou l'autre `PutDatabaseRecord` qui échoue à écrire) est unifié ici avant
@@ -196,7 +219,7 @@ fournie dans
 
 ## Infrastructure
 
-Tout ce qui précède — trois extracteurs, le routage NiFi, le puits
+Tout ce qui précède — quatre extracteurs, le routage NiFi, le puits
 PostgreSQL, et l'archivage à froid — tourne sur six invités d'un seul hôte
 Proxmox, provisionnés via cloud-init (`qm`/`pct`) sans couche
 Terraform/Ansible par-dessus. Les vraies adresses LAN ne figurent pas ici,
@@ -270,7 +293,8 @@ exactly-once au rejeu gratuitement, et `jsonb` héberge le tableau
 par-streamer de `zevent_api.py` (`bronze_zevent_snapshots.streamers`) sans
 schéma rigide une-colonne-par-champ. Rien ici n'est écrit pour être
 interrogé à échelle analytique — c'est une couche bronze/brute, pas un
-entrepôt de données.
+entrepôt de données (l'entrepôt, c'est le rôle de dbt maintenant — voir
+[Transformation des données (dbt)](#transformation-des-données-dbt)).
 
 ### Pourquoi Parquet en double écriture, pas juste un cache local
 
@@ -374,10 +398,11 @@ dernière réécriture multi-chaînes :
   requête (la limite propre de Twitch) ; les `JOIN` IRC sont cadencés
   (`IRC_JOIN_PACING_SECONDS`) pour rester sous la limite de connexion par
   10s de Twitch.
-- **Backpressure native de NiFi** — chaque connexion entre processeurs a
-  un seuil objets/taille que NiFi applique nativement ; aucune n'a encore
-  été testée en charge contre du trafic Zevent réel (voir
-  [Performance](#performance) ci-dessous).
+- **Backpressure native de NiFi, par connexion** — chaque connexion entre
+  processeurs a un seuil objets/taille que NiFi applique nativement ;
+  testée en charge de façon synthétique sur `srv-dev` (voir
+  [Performance](#performance) ci-dessous), mais pas encore contre du trafic
+  Zevent réel.
 - **Archivage, pas accumulation** —
   [`archive_parquet.py`](archive_parquet.py)/[`archive_logs.py`](archive_logs.py)
   sont des scripts autonomes, lancés par cron (pas partie des extracteurs
@@ -393,14 +418,117 @@ dernière réécriture multi-chaînes :
 
 ## Performance
 
-Pas encore mesuré en conditions réelles — le Zevent n'a pas encore eu lieu
-sur cette ligne temporelle. Cette section sera complétée après l'événement
-avec de vrais chiffres tirés de `logging/` (voir
-[Journalisation](#journalisation)) et de PostgreSQL lui-même (nombre de
-lignes, contenu de `nifi/dead-letter/`, nombre de redémarrages), pas des
-chiffres projetés ou supposés. Prévu pour rapporter : le débit soutenu, le
-taux de dead-letter, le nombre de reconnexions IRC par shard, et si un
-redémarrage manuel a été nécessaire sur la durée totale de l'événement.
+Les vrais chiffres de l'événement (débit, taux de dead-letter, nombre de
+reconnexions IRC par shard, nombre de redémarrages manuels) ne sont toujours
+pas mesurés — le Zevent n'a pas encore eu lieu sur cette ligne temporelle, et
+cette note sera complétée après coup avec de vrais chiffres tirés de
+`logging/` (voir [Journalisation](#journalisation)) et de PostgreSQL
+lui-même, pas des chiffres projetés.
+
+Ce qui *a* été mesuré : un test de charge/capacité synthétique du plafond du
+pipeline d'ingestion, mené contre l'instance NiFi de dev (`srv-dev`, base
+`zevent-dev`) le 30/08/2026 via `stress_test.py` — un générateur de charge
+montante qui poste des lots `live_chat` synthétiques vers `/ingest`. Ceci
+exerce le pipeline lui-même (webhook → NiFi → Postgres), pas un vrai volume
+de chat Twitch.
+
+### Ligne de base (réglages NiFi par défaut, non ajustés)
+
+Chaque processeur du flow a par défaut `Concurrent Tasks = 1` chez NiFi ; le
+`DBCPConnectionPool` a par défaut `Max Total Connections = 8` ; chaque
+connexion inter-processeurs a par défaut un seuil de backpressure de 10 000
+flowfiles.
+
+- **1 producteur concurrent :** ~220 req/s (~4 400 lignes/s) acceptées, 0%
+  d'erreurs, en régime soutenu.
+- **≥2 producteurs concurrents :** HTTP 503 immédiat de `ListenHTTP`, en
+  ~5ms — confirmé via la réponse servlet et les logs de NiFi lui-même, pas
+  un artefact côté client. Cause racine : avec chaque processeur plafonné à
+  1 tâche concurrente, la file juste en aval de `ListenHTTP` se remplit
+  presque instantanément, et `ListenHTTP` commence à rejeter carrément les
+  nouvelles connexions au lieu de les mettre en attente.
+- **Risque pratique que ça expose :** `zevent-main.service`,
+  `zevent-api.service`, et `zevent-donation-goals.service` poussent tous
+  vers le même `NIFI_WEBHOOK_URL` indépendamment. `nifi_client.push_batch`
+  ne retente volontairement pas un rejet HTTP définitif (seulement les
+  timeouts ambigus — voir [Mécanismes de
+  fiabilité](#mécanismes-de-fiabilité)), donc deux services qui postent au
+  même instant pourraient silencieusement perdre un lot sous ce réglage par
+  défaut non ajusté.
+
+### Après réglage
+
+Changements appliqués en direct via l'API REST de NiFi (voir la mise en
+garde sur la persistance ci-dessous) :
+
+| Réglage | Avant | Après |
+|---|---|---|
+| Concurrent Tasks de `ListenHTTP` / `PutDatabaseRecord (INSERT)` | 1 | 8 |
+| Concurrent Tasks de `EvaluateJsonPath` / `RouteOnAttribute` / `SplitJson (insert)` | 1 | 4 |
+| Concurrent Tasks de `SplitJson (upsert)` / `PutDatabaseRecord (UPSERT)` / processeurs dead-letter | 1 | 2 |
+| Max Total Connections de `DBCPConnectionPool` | 8 | 24 |
+| Seuil objet de backpressure de connexion | 10 000 | 50 000 |
+| `nifi.content.repository.archive.max.retention.period` | 7 jours | 2 minutes |
+| `nifi.content.repository.archive.max.usage.percentage` | 50% | 90% |
+
+Résultats :
+
+- **Acceptation webhook :** propre (0% d'erreurs) jusqu'à une concurrence de
+  25, ~162 850 lignes/s, latence p50/p95/p99 de 7/12/22ms.
+- **Le plafond a bougé, pas disparu :** le taux d'erreur dépasse 20% à une
+  concurrence de 50 ; saturation complète (100% d'erreurs) à une concurrence
+  de 100. Le point de rupture est passé de « n'importe quelle 2e connexion
+  concurrente » à environ 25-50 producteurs concurrents.
+- **Débit d'insertion en base soutenu, en régime établi : ~2 700-3 000
+  lignes/s**, mesuré directement contre la croissance des lignes de
+  `bronze_live_chat` (pas seulement l'acceptation côté HTTP) —
+  confortablement au-dessus du pic de ~190 msg/s estimé dans [Mécanismes de
+  fiabilité](#mécanismes-de-fiabilité).
+
+### Constats de stabilité
+
+- **La limitation d'archive du content-repository est une vérification sur
+  toute la partition, pas spécifique à NiFi.**
+  `nifi.content.repository.archive.max.usage.percentage` compare contre tout
+  le système de fichiers sur lequel vit le content repository de NiFi — sur
+  un disque déjà >50% plein à cause de données sans rapport, des écritures
+  soutenues à fort volume se bloquent (`Unable to write flowfile content ...
+  waiting for archive cleanup`) peu importe le peu que NiFi lui-même a
+  archivé. Rencontré sur `srv-dev` (un disque partagé de 38 Go, ~69%
+  utilisé par des données hors NiFi) bien avant que l'empreinte propre de
+  NiFi ne soit significative (son archive faisait 1,64 Mo à ce moment-là).
+- **Les files profondes dégradent le débit de façon non linéaire.** Une
+  fois qu'une file de connexion dépasse le seuil de swap en mémoire de NiFi
+  (10 000 flowfiles), elle commence à swapper sur disque ; un arriéré qui
+  oscille autour de ce seuil provoque un va-et-vient répété de
+  swap-out/swap-in qui a fait chuter le débit de vidange mesuré d'environ
+  3 000 lignes/s à ~60 lignes/s. Garder les rafales sous ~10K flowfiles de
+  profondeur (ou relever le seuil de swap en même temps que la
+  backpressure) évite cette falaise.
+- **La propriété `Password` de `DBCPConnectionPool` est masquée
+  (`********`) à chaque `GET`.** Renvoyer un dict `properties` récupéré tel
+  quel dans un `PUT` — même pour changer une propriété sans rapport comme
+  la taille du pool — écrase silencieusement le vrai mot de passe par ce
+  placeholder. A causé une coupure d'écriture en base de production d'environ
+  8,5 minutes sur `srv-dev` pendant ce test (12:45:36–12:54:05 UTC,
+  30/08/2026) avant d'être repérée et annulée. Tout futur changement de
+  config scripté via l'API NiFi doit retirer ou re-fournir explicitement les
+  propriétés sensibles, jamais les faire simplement l'aller-retour.
+
+### Mises en garde
+
+- Ce sont des chiffres de capacité synthétiques venant de `srv-dev`, pas du
+  vrai trafic Zevent — les chiffres du vrai événement notés en haut de
+  cette section restent à venir.
+- Les réglages ajustés ci-dessus ont été appliqués en direct via l'API REST
+  de NiFi et une édition de `nifi.properties` à l'intérieur du conteneur en
+  marche. **Aucun des deux n'est persistant** — recréer le conteneur
+  (`docker compose up --force-recreate`, ou toute reconstruction — un simple
+  `docker restart` ne pose pas de problème) ramène les deux aux valeurs par
+  défaut de NiFi, réintroduisant silencieusement le plafond de concurrence
+  à 1. Si ces réglages doivent être permanents, ils doivent être déplacés
+  dans le template de flow (`flow-templates/zevent-ingest-flow.json`) et
+  dans `docker-compose.yml`/un `nifi.properties` monté, respectivement.
 
 ## Structure du projet
 
@@ -409,6 +537,7 @@ redémarrage manuel a été nécessaire sur la durée totale de l'événement.
 ├── main.py                  # extracteur Twitch multi-chaînes (chat + métadonnées)
 ├── zevent_api.py             # poller de zevent.fr/api/ (snapshot de tout l'événement)
 ├── zevent_donation_goals.py   # poller des objectifs de dons par streamer
+├── emote_catalog.py            # poller de catalogues d'emotes Twitch/7TV/BetterTTV/FrankerFaceZ
 ├── archive_parquet.py        # déplace les vieux fichiers Parquet locaux vers le cold storage (cron)
 ├── setup_archive.sh          # configuration SSH+cron unique pour archive_parquet.py
 ├── nifi_client.py             # helper HTTP partagé (batching, retries-safe)
@@ -416,13 +545,22 @@ redémarrage manuel a été nécessaire sur la durée totale de l'événement.
 ├── logging.yaml                # handlers de fichiers rotatifs + console colorée
 ├── sql/001_bronze_schema.sql    # tables bronze PostgreSQL (appliquées sur srv-db)
 ├── sql/002_donation_goals.sql    # bronze_donation_goals (état courant, UPSERT)
+├── sql/003_live_chat_chatter_attributes.sql  # bronze_live_chat + badges/user_type/account_created_at/broadcaster_type
+├── sql/004_live_chat_emotes.sql   # bronze_live_chat + emotes (Twitch natif, depuis les tags IRC)
+├── sql/005_emote_catalog.sql       # bronze_emote_catalog (état courant, UPSERT)
+├── dbt/                             # couche de transformation : bronze_* -> stg/int/marts
+│   ├── models/staging/                # vues 1:1 typées sur bronze_*
+│   ├── models/intermediate/           # jointures, fonctions fenêtrées, agrégations
+│   ├── models/marts/                  # la surface d'analyse — voir Analyse des données
+│   └── dbt_project.yml, profiles.yml, packages.yml
+├── run_dbt.sh                         # invoqué par le workflow dbt (manuel) / à la main
 ├── docker-compose.yml              # stack NiFi locale (srv-prod uniquement)
 ├── nifi/dead-letter/                 # échecs de PutDatabaseRecord atterrissent ici
 ├── drivers/                            # driver JDBC PostgreSQL, monté dans NiFi
 ├── openapi.yaml                          # chaque appel à l'API Twitch externe, documenté
 ├── ARCHITECTURE.md                         # pipeline de production cible, en détail
 ├── DEPLOYMENT.md                             # configuration CD : secrets, accès srv-prod
-├── .github/workflows/                          # CI (lint/test/sécurité) + CD (srv-prod)
+├── .github/workflows/                          # CI, CD (srv-prod), dbt (manuel)
 └── data/                                         # sortie Parquet locale (gitignored)
 ```
 
@@ -469,7 +607,19 @@ pour le pourquoi). Le port d'ingestion des données (`ListenHTTP`) est
 ```bash
 psql "postgresql://<user>@<srv-db-host>:5432/zevent" -f sql/001_bronze_schema.sql
 psql "postgresql://<user>@<srv-db-host>:5432/zevent" -f sql/002_donation_goals.sql
+psql "postgresql://<user>@<srv-db-host>:5432/zevent" -f sql/003_live_chat_chatter_attributes.sql
+psql "postgresql://<user>@<srv-db-host>:5432/zevent" -f sql/004_live_chat_emotes.sql
+psql "postgresql://<user>@<srv-db-host>:5432/zevent" -f sql/005_emote_catalog.sql
 ```
+
+`003` et `004` font un `ALTER TABLE bronze_live_chat` — contrairement à
+`001`/`002`/`005`, qui ne font que créer de nouvelles tables, ce qui veut
+dire que le processeur `PutDatabaseRecord` (INSERT) construit à l'étape 5
+ci-dessous doit être redémarré *après* les avoir appliqués, sinon son schéma
+de table mis en cache laisse silencieusement tomber les nouvelles colonnes.
+Voir le commentaire d'en-tête de l'un ou l'autre fichier, ou
+[`ARCHITECTURE.md`, étape 6a](ARCHITECTURE.md#6a-putdatabaserecord--insert-branch-insert-relationship),
+pour le pourquoi.
 
 ### 5. Construire le flow NiFi
 
@@ -480,11 +630,14 @@ Le construire selon le diagramme [Architecture](#architecture) ci-dessus —
 `SplitJson` → `PutDatabaseRecord` (+ `PutFile` dead-letter sur échec). La
 configuration complète des processeurs est dans
 [`ARCHITECTURE.md`](ARCHITECTURE.md#2-how-the-pieces-in-this-repo-map-onto-the-diagram).
-Le flux `donation_goals` a besoin de sa propre branche `PutDatabaseRecord`
-(routée par `RouteOnAttribute` sur `stream == "donation_goals"`) configurée
-avec **Statement Type : UPSERT** et **Update Keys : participation_id,
-goal_id** — chaque autre flux utilise un simple `INSERT` — voir
-`sql/002_donation_goals.sql`.
+Les flux `donation_goals` et `emote_catalog` partagent une seule branche
+`PutDatabaseRecord` (routée par `RouteOnAttribute` sur `stream in
+('donation_goals', 'emote_catalog')`) configurée avec **Statement Type :
+UPSERT** et une expression **Update Keys** par flux — voir
+`sql/002_donation_goals.sql` / `sql/005_emote_catalog.sql`, ou
+[`ARCHITECTURE.md`, étape 6b](ARCHITECTURE.md#6b-putdatabaserecord--upsert-branch-upsert-relationship)
+pour les expressions exactes — chaque autre flux utilise un simple
+`INSERT`.
 
 ### 6. Lancer les extracteurs
 
@@ -492,6 +645,7 @@ goal_id** — chaque autre flux utilise un simple `INSERT` — voir
 uv run main.py                    # toutes les chaînes Zevent : chat + métadonnées
 uv run zevent_api.py              # snapshot de tout l'événement (dons, viewers)
 uv run zevent_donation_goals.py   # liste des objectifs de dons de chaque streamer
+uv run emote_catalog.py           # catalogues d'emotes Twitch/7TV/BetterTTV/FrankerFaceZ de chaque chaîne
 ```
 
 Chacun est indépendant — lancer n'importe quel sous-ensemble. Au premier
@@ -504,16 +658,17 @@ processus s'arrête proprement — voir
 ### Exécution en tant que service (démarrage/arrêt)
 
 Pour un événement de longue durée (le Zevent dure ~55h), les trois
-extracteurs tournent comme services systemd plutôt qu'en `uv run` au premier
-plan. Dev et prod sont deux checkouts entièrement séparés sur deux machines
-séparées — `twitch-analytics` sur `srv-dev`, pointant vers le NiFi local de
-srv-dev (base `zevent-dev`), et `twitch-analytics-prod` sur `srv-prod`,
-pointant vers le NiFi local de srv-prod (base `zevent`) — chacun avec son
-propre `.env`. Chaque checkout a son propre `.tio.tokens.json`, donc chacun
-a besoin de sa propre approbation Twitch device-code, une seule fois. Sur
-srv-prod, ce même checkout est aussi la cible du déploiement CD : la stack
-NiFi (`docker-compose.yml` + `drivers/`), les extracteurs Python et les
-scripts d'archivage (source, `sql/`, fichiers de dépendances), et — via une
+extracteurs principaux tournent comme services systemd plutôt qu'en
+`uv run` au premier plan. Dev et prod sont deux checkouts entièrement
+séparés sur deux machines séparées — `twitch-analytics` sur `srv-dev`,
+pointant vers le NiFi local de srv-dev (base `zevent-dev`), et
+`twitch-analytics-prod` sur `srv-prod`, pointant vers le NiFi local de
+srv-prod (base `zevent`) — chacun avec son propre `.env`. Chaque checkout a
+son propre `.tio.tokens.json`, donc chacun a besoin de sa propre
+approbation Twitch device-code, une seule fois. Sur srv-prod, ce même
+checkout est aussi la cible du déploiement CD : la stack NiFi
+(`docker-compose.yml` + `drivers/`), les extracteurs Python et les scripts
+d'archivage (source, `sql/`, `dbt/`, fichiers de dépendances), et — via une
 autorisation sudoers étroitement ciblée pour l'utilisateur de déploiement —
 un `uv sync` suivi d'un redémarrage des trois unités systemd
 `zevent-*-prod` (voir DEPLOYMENT.md) ; sur srv-dev, NiFi et les extracteurs
@@ -540,6 +695,14 @@ sudo systemctl disable zevent-api-prod zevent-donation-goals-prod zevent-main-pr
 
 Les six sont en `Restart=on-failure` — un crash redémarre automatiquement,
 un `stop` manuel non (jusqu'au prochain reboot, sauf `disable` en plus).
+
+**`emote_catalog.py` n'a pas encore d'unité systemd.** Contrairement aux
+trois extracteurs ci-dessus, il ne fait partie ni de ces commandes
+`start`/`stop`, ni de l'autorisation sudoers de DEPLOYMENT.md, ni de
+l'étape « restart zevent services » de `cd.yml` — pour un vrai événement,
+il lui faut sa propre `zevent-emote-catalog[-prod].service` (même modèle
+que les trois autres) ajoutée aux trois endroits, ou il doit être lancé à
+la main (`uv run emote_catalog.py`, en arrière-plan) à la place.
 
 ### Archivage des anciens fichiers Parquet et des sauvegardes de logs
 
@@ -640,6 +803,7 @@ Points saillants :
 | `IRC_JOIN_PACING_SECONDS` | `0.5` | Délai entre les `JOIN` IRC, pour respecter la limite de débit de Twitch |
 | `METADATA_SNAPSHOT_INTERVAL_SECONDS` | `15` | Intervalle de polling Helix par lots (toutes chaînes, toutes métadonnées) |
 | `ROSTER_REFRESH_INTERVAL_SECONDS` | `15` | Fréquence à laquelle `main.py` rafraîchit la liste pour détecter de nouveaux streamers en cours d'événement |
+| `CHATTER_LOOKUP_INTERVAL_SECONDS` | `30` | Fréquence à laquelle les chatteurs non résolus reçoivent un appel groupé Helix Get Users (`account_created_at`/`broadcaster_type`) |
 | `ZEVENT_API_POLL_INTERVAL_SECONDS` | `20` | Intervalle de polling de `zevent.fr/api/` |
 | `FLUSH_INTERVAL_SECONDS` | `30` | Fréquence à laquelle les lignes en tampon sont vidées vers Parquet/NiFi |
 | `MAX_ROWS_PER_PARQUET_FILE` | `100000` | Nombre de lignes avant qu'un fichier Parquet ne tourne |
@@ -654,10 +818,14 @@ Points saillants :
 | `NIFI_ADMIN_USERNAME` / `NIFI_ADMIN_PASSWORD` | — | Connexion single-user de l'UI NiFi (docker-compose) |
 | `DONATION_GOALS_POLL_INTERVAL_SECONDS` | `300` | Intervalle de polling de `zevent_donation_goals.py` |
 | `DONATION_GOALS_MAX_CONCURRENCY` | `5` | Nombre max de requêtes concurrentes de détail d'objectif par streamer |
+| `EMOTE_CATALOG_POLL_INTERVAL_SECONDS` | `1800` | Intervalle de polling d'`emote_catalog.py` — les catalogues d'emotes sont quasi statiques, contrairement à tout le reste que ce dépôt sonde |
+| `EMOTE_CATALOG_MAX_CONCURRENCY` | `10` | Nombre max de requêtes concurrentes de catalogue d'emotes par chaîne (les quatre services combinés) |
+| `POSTGRES_HOST` / `PGBOUNCER_PORT` / `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | — | Lues par aucun script Python — seulement par `dbt/profiles.yml` (`env_var()`) et, pour les humains, la config du `DBCPConnectionPool` de NiFi |
+| `DBT_TARGET` | `dev` | Quelle sortie de `dbt/profiles.yml` utiliser — `dev` = `zevent-dev`, `prod` = `zevent` (voir [Transformation des données (dbt)](#transformation-des-données-dbt)) |
 
 ## Modèle de données
 
-Quatre tables dans PostgreSQL, une par valeur de `stream` poussée via NiFi.
+Cinq tables dans PostgreSQL, une par valeur de `stream` poussée via NiFi.
 
 `bronze_live_chat`, `bronze_metadata_snapshots`, et
 `bronze_zevent_snapshots` (`sql/001_bronze_schema.sql`) sont append-only :
@@ -667,7 +835,7 @@ doublon.
 
 | Table | Alimentée par | Colonnes notables |
 |---|---|---|
-| `bronze_live_chat` | `main.py` (IRC) | `channel`, `chatter`, `chatter_id`, `message_text`, `message_sent_at`, `captured_at` |
+| `bronze_live_chat` | `main.py` (IRC) | `channel`, `chatter`, `chatter_id`, `message_text`, `message_sent_at`, `captured_at`, `badges` (`jsonb`, extrait du tag IRC `badges` — par ex. `moderator`, `subscriber`, `vip`, `founder`, `partner`, `turbo`, `premium`, `broadcaster`, `staff`, `admin`), `user_type` (tag IRC `user-type` : `staff`/`admin`/`global_mod`/vide), `emotes` (`jsonb`, `{emote_id: nombre_d_occurrences}` extrait du tag IRC `emotes` — emotes natives Twitch uniquement ; les emotes tierces n'ont aucun tag du tout, voir `bronze_emote_catalog` plus bas), `account_created_at`, `broadcaster_type` (`affiliate`/`partner`/vide — les deux via une recherche Helix Get Users mise en cache, voir `CHATTER_LOOKUP_INTERVAL_SECONDS`) |
 | `bronze_metadata_snapshots` | `main.py` (polling Helix) | `channel`, `is_live`, `title`, `category`, `viewer_count`, `duration_seconds`, `stream_started_at`, `snapshot_at` |
 | `bronze_zevent_snapshots` | `zevent_api.py` | `website_mode`, `total_donation_amount_eur`, `total_viewer_count`, `streamers` (`jsonb` : `twitch_id`, `twitch_login`, `display_name`, `profile_url`, `online`, `game`, `viewer_count`, `donation_amount_eur` par streamer) |
 
@@ -681,14 +849,28 @@ un nouveau poll écrase chaque ligne d'objectif en place.
 |---|---|---|
 | `bronze_donation_goals` | `zevent_donation_goals.py` | `participation_id`, `streamer_name`, `twitch_login`, `twitch_id`, `goal_id`, `goal_name`, `goal_amount_eur`, `goal_category`, `snapshot_at` |
 
+`bronze_emote_catalog` (`sql/005_emote_catalog.sql`) pose le même genre de
+problème : seulement le catalogue d'emotes *actuel* par service/chaîne, pas
+un historique. `UNIQUE (service, scope, channel, emote_id)` est la clé
+UPSERT. `channel` est délibérément `NOT NULL` — un sentinel `'__global__'`
+pour les lignes `scope = 'global'`, pas `NULL` — puisque Postgres traite
+`NULL` comme distinct de `NULL` dans une contrainte `UNIQUE`, ce qui
+transformerait silencieusement chaque nouveau poll des ensembles globaux en
+nouvelles insertions en double au lieu de mises à jour en place. Voir le
+commentaire d'en-tête de ce fichier.
+
+| Table | Alimentée par | Colonnes notables |
+|---|---|---|
+| `bronze_emote_catalog` | `emote_catalog.py` | `service` (`twitch`/`7tv`/`bttv`/`ffz`), `scope` (`global`/`channel`), `channel`, `emote_id`, `emote_code`, `fetched_at` |
+
 ## Journalisation
 
 Configurée de façon centralisée par
 [`logging_setup.py`](logging_setup.py) à partir de
 [`logging.yaml`](logging.yaml) — chaque logger de module
 (`zevent_extractor`, `nifi_client`, `zevent_api`, `zevent_donation_goals`,
-`twitchio.*`) remonte vers le logger racine, qui détermine réellement où va
-la sortie.
+`emote_catalog`, `twitchio.*`) remonte vers le logger racine, qui détermine
+réellement où va la sortie.
 
 Deux profils, sélectionnés via `APP_ENV` :
 
@@ -718,12 +900,17 @@ dépôt — CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
 exécute les mêmes vérifications, plus le lint OpenAPI, la validation
 `docker-compose.yml`/YAML, et le scan de secrets, à chaque push et pull
 request. CD ([`.github/workflows/cd.yml`](.github/workflows/cd.yml))
-déploie la stack NiFi, les extracteurs Python, et les scripts d'archivage
-vers srv-prod après le succès de CI sur `main` — en rafraîchissant les
-dépendances et en redémarrant les trois unités systemd `zevent-*-prod` —
-avec une approbation manuelle comme verrou — voir
+déploie la stack NiFi, les extracteurs Python, `dbt/`, et les scripts
+d'archivage vers srv-prod après le succès de CI sur `main` — en appliquant
+chaque migration de `sql/` contre srv-db, en redémarrant NiFi sans condition
+pour que son schéma de table en cache ne puisse jamais être périmé, en
+rafraîchissant les dépendances, et en redémarrant les trois unités systemd
+`zevent-*-prod` — avec une approbation manuelle comme verrou — voir
 [`DEPLOYMENT.md`](DEPLOYMENT.md) pour la configuration et le
-fonctionnement.
+fonctionnement. Un workflow séparé, `dbt (manuel)`, ne se déclenche que
+manuellement (`workflow_dispatch`, jamais sur push/PR/planification) pour
+lancer `dbt build` sur srv-prod — voir [Transformation des données
+(dbt)](#transformation-des-données-dbt).
 
 ## Limitations connues
 
@@ -760,6 +947,12 @@ fonctionnement.
   d'être supprimée. Pas censé poser problème en pratique (les objectifs ne
   sont observés qu'à être ajoutés à mesure que l'événement approche), mais
   une ligne périmée nécessiterait un `DELETE` manuel.
+- **Les emotes supprimées ne sont pas effacées non plus**, pour la même
+  raison. `bronze_emote_catalog` est maintenue à jour par UPSERT, avec pour
+  clé `(service, scope, channel, emote_id)` — une emote supprimée ou
+  renommée en amont (par Twitch, 7TV, BetterTTV, ou FrankerFaceZ) laisse une
+  ligne périmée plutôt que d'être retirée, puisqu'aucune des quatre sources
+  n'expose d'endpoint « qu'est-ce qui a changé » pour le détecter.
 - **`api.ppr.evenmorestats.fr` n'est ni documentée ni officielle.** C'est le
   backend que `zevent.gdoc.fr` (un site compagnon tiers, pas géré par
   Zevent lui-même) se trouve appeler — rétro-ingénieré depuis son bundle
@@ -795,40 +988,120 @@ et [Limitations connues](#limitations-connues) ci-dessus :
   pendant l'événement lui-même, donc un problème en train de se développer
   (par ex. un shard IRC bloqué) n'est visible qu'en suivant les logs, pas
   en jetant un œil à un tableau de bord.
-- **La backpressure NiFi et le dimensionnement du pool PgBouncer sont tous
-  deux non vérifiés en charge réelle.** La backpressure par connexion de
-  NiFi est déjà signalée comme non testée ; il en va de même pour le pool
-  de connexions de PgBouncer face au pic estimé de ~190 msg/s dans
-  [Mécanismes de fiabilité](#mécanismes-de-fiabilité) — aucun des deux n'a
-  été testé en charge de bout en bout.
+- **La backpressure NiFi a été testée en charge synthétiquement ; le
+  dimensionnement du pool PgBouncer, lui, reste non vérifié en charge
+  réelle.** La backpressure par connexion de NiFi et le dimensionnement de
+  son `DBCPConnectionPool` ont maintenant été testés en charge de façon
+  synthétique (voir [Performance](#performance) — ~2 700-3 000 lignes/s en
+  régime soutenu), mais ça n'exerce que le côté NiFi de la connexion JDBC ;
+  la config propre du pool de PgBouncer sur `srv-db` (non gérée par ce
+  dépôt) face à ce même débit n'a pas été vérifiée séparément.
 
-## Outillage d'analyse de données futur
+## Transformation des données (dbt)
 
-Une proposition, pas une implémentation — ce dépôt n'a actuellement aucune
-couche de visualisation ; il s'arrête aux tables `bronze_*` dans
-PostgreSQL sur `srv-db` (géré en dehors de ce dépôt, voir
-[ARCHITECTURE.md](ARCHITECTURE.md)), plus la copie Parquet désormais aussi
-alimentée vers le cold storage par `archive_parquet.py`. Le risque
-principal pour tout futur outil d'analyse est de naïvement charger « toutes
-les données » en mémoire côté client (un onglet de navigateur, un glob
-`pandas.read_parquet`, une requête de tableau de bord non paginée) au lieu
-de pousser l'agrégation là où les données vivent déjà :
+`dbt/` transforme `bronze_*` (dans `public`, alimentée par les quatre
+extracteurs ci-dessus) en trois schémas — `stg`/`int`/`marts`, pas le
+nommage par défaut de dbt `<schéma_cible>_stg` (voir
+`dbt/macros/generate_schema_name.sql`). Adaptateur Postgres
+(`dbt-postgres`), mêmes informations de connexion que les extracteurs
+(`POSTGRES_HOST`/`PGBOUNCER_PORT`/`POSTGRES_DB`/`POSTGRES_USER`/
+`POSTGRES_PASSWORD` — voir [Référence de
+configuration](#référence-de-configuration)), lues via `env_var()` dans
+`dbt/profiles.yml`, ce qui est sûr à commiter (aucun identifiant en clair
+dedans) et cible `dev` (`zevent-dev`) par défaut, `prod` (`zevent`) via
+`DBT_TARGET=prod`.
 
-- **Analyse ponctuelle : DuckDB.** Son extension `postgres_scanner` peut
-  interroger `bronze_*` directement sans étape ETL, et il peut aussi
-  interroger les fichiers Parquet archivés (localement, ou via
-  `httpfs`/un chemin monté en SSH) sans les matérialiser entièrement en
-  mémoire — colonnaire, avec pushdown de prédicat/projection. C'est l'outil
-  naturel pour une exploration ponctuelle après l'événement, contre l'un ou
-  l'autre puits.
-- **Analyse interactive/scriptée : Polars.** Préférer un pipeline
-  `LazyFrame` (filtre/agrégation, `.collect()` seulement à la fin) à
-  `pandas.read_parquet()` sur un glob de répertoire entier, qui force tout
-  le jeu de données en mémoire dès le départ, quelle que soit la portion
-  dont l'analyse a réellement besoin.
-- **Un tableau de bord, si un jour construit :** soit Streamlit/Evidence
-  lisant des requêtes DuckDB/Postgres déjà agrégées et mises en cache
-  (jamais un `SELECT *` brut lié au chargement de la page), soit un outil
-  BI no-code (Grafana/Metabase) pointé directement sur Postgres —
-  cohérent avec le fait que Postgres est déjà la source de vérité en dehors
-  de ce dépôt, plutôt que d'en dériver une nouvelle depuis Parquet.
+```bash
+uv sync --group dbt
+set -a && source .env && set +a   # dbt/profiles.yml lit ces variables via env_var()
+cd dbt
+uv run dbt deps    # installe packages.yml : dbt-utils, dbt-expectations, elementary
+uv run dbt build   # exécute chaque modèle + test, de staging à marts
+```
+
+- **`stg_bronze__*`** (5 modèles) : des vues 1:1 typées sur chaque table
+  `bronze_*`, plus une vraie transformation —
+  `stg_bronze__zevent_snapshots` déplie le tableau jsonb `streamers` en
+  une ligne par streamer par snapshot.
+- **`int_*`** (15 modèles) : les vraies jointures/fonctions
+  fenêtrées/agrégations — deltas de dons et rang au classement depuis des
+  snapshots successifs, agrégations horaires de chat/viewers, agrégats au
+  niveau chatteur et chatteur×chaîne, usage des emotes (Twitch natif +
+  correspondance de token contre `bronze_emote_catalog` pour les tierces),
+  transferts de chaîne inférés, et recouvrement d'audience par paire de
+  chaînes à l'échelle de l'événement (indice de Jaccard).
+- **`mart_*`** (33 modèles) : la vraie surface d'analyse — voir plus bas.
+
+Deux `vars` au niveau du projet (`dbt/dbt_project.yml`) gardent les choix
+arbitraires réglables sans toucher au SQL : `chatter_profile_*_max_channels`
+(les seuils sedentaire/multi_streamer/semi_nomade/nomade) et
+`chatter_migration_max_gap_minutes` (à quel point deux messages sur des
+chaînes différentes doivent être proches pour compter comme un transfert
+inféré).
+
+**dbt ne se déclenche jamais automatiquement, nulle part** — pas de hook
+on-commit/on-push, pas d'étape CI, pas de planification. En local, c'est le
+`uv run dbt build` ci-dessus. Sur srv-prod, c'est le workflow GitHub Actions
+[`dbt (manuel)`](.github/workflows/dbt.yml) — `workflow_dispatch`
+uniquement, déclenché depuis l'onglet Actions quand quelqu'un le décide,
+jamais enchaîné après CI ou CD — voir [DEPLOYMENT.md, « Running
+dbt »](DEPLOYMENT.md#running-dbt). Le déploiement normal de CD synchronise
+quand même le code de `dbt/` vers srv-prod à chaque fusion sur `main` (voir
+[DEPLOYMENT.md](DEPLOYMENT.md)) ; cette synchronisation et l'exécution
+effective de dbt sont deux actions séparées, délibérément découplées.
+
+## Qualité des données
+
+Chaque modèle ci-dessus porte des tests, exécutés dans le cadre de
+`dbt build` : génériques (`unique`, `not_null`, `accepted_values`),
+`dbt_utils.unique_combination_of_columns` sur la vraie granularité de
+chaque modèle (par ex. `(chatter_id, channel)`, `(service, scope, channel,
+emote_id)`), et des vérifications de plage `dbt_expectations` sur les
+valeurs qui ne devraient jamais être négatives (par ex.
+`donation_delta_eur >= 0`). `elementary` tourne à chaque `dbt build` (ses
+propres modèles font partie du DAG) pour préparer la détection d'anomalies,
+même s'il a besoin de plusieurs exécutions dans le temps pour se
+construire une référence — une seule exécution n'a pas encore de données
+historiques auxquelles se comparer.
+
+Deux constats de qualité des données révélés *par* ces tests/modèles, pas
+par inspection manuelle :
+
+- **Les chaînes de test de charge de `stress_test.py` peuvent fuiter dans
+  l'analyse réelle** si son propre nettoyage suggéré (`DELETE FROM
+  bronze_live_chat WHERE channel = 'stress-test-...'`, imprimé par le
+  script lui-même) n'est pas exécuté — une chaîne `stress-test-*` est
+  apparue dans `mart_chat__engagement_vs_donations` avec des millions de
+  messages en une seule heure pendant le développement. Pas filtrée dans
+  `stg_bronze__live_chat` par défaut ; ajouter un `WHERE channel NOT LIKE
+  'stress-test-%'` là si les tests de charge et l'analyse réelle doivent
+  coexister dans la même base.
+- **`mart_donations__reconciliation`** (total de l'événement vs. somme des
+  montants par streamer, par snapshot) est exactement ce genre de
+  vérification transformée en mart interrogeable plutôt qu'une comparaison
+  ponctuelle — une divergence signifierait des dons atterris sur la
+  cagnotte globale de l'événement sans être attribués à un streamer.
+
+## Analyse des données
+
+La couche `mart_*` est la vraie surface d'analyse — chaque mart ci-dessous
+n'est qu'à un `SELECT`, sans agrégation restante à faire côté client
+(cohérent avec la direction Streamlit/`st.cache_data`-sur-requêtes-déjà-
+agrégées esquissée avant que cette couche n'existe).
+
+| Sujet | Marts | Couvre |
+|---|---|---|
+| Dons | `donations__timeseries`, `donations__by_title`, `donations__normalized`, `donations__spike_moments`, `donations__rank_churn`, `donations__reconciliation`, `donation_goals__current`, `donation_goals__by_category`, `donations__goal_ambition_vs_reality` | Totaux + vélocité dans le temps, quels titres/catégories ont attiré le plus, efficacité par viewer/par chatteur, les plus gros pics de vélocité avec contexte, volatilité du classement, vérification qualité total-événement-vs-somme-des-parties, objectifs actuels et leurs catégories |
+| Chat | `chat__engagement_vs_donations`, `chat__emote_trends`, `chat__new_chatters_per_channel`, `chat__badge_and_verbosity`, `chat__spikes` | Volume de messages vs. vélocité des dons (l'hypothèse de dimensionnement derrière le propre modèle de fiabilité de ce projet, testée contre de vraies données), tendances d'emotes (natives + 7TV/BetterTTV/FrankerFaceZ), croissance de l'audience de chat par chaîne, mix badge/abonné et verbosité, pics d'activité par chaîne (z-score contre la propre référence de la chaîne) |
+| Chatteurs | `chatters__profile`, `chatters__leaderboard`, `chatters__account_age_profile`, `chatters__retention`, `chatters__breadth_depth_lifespan`, `chatters__bot_signal` | Classification sedentaire/multi_streamer/semi_nomade/nomade, rang par chaîne et à l'échelle de l'événement, tranches d'âge de compte, comportement de retour jour après jour, largeur vs. profondeur et durée de vie, signaux faibles de bot/compte-jetable (pas un classificateur) |
+| Streamers/streams | `streamers__profile`, `streamers__diurnal_profile`, `streamers__night_shift`, `streams__viewership_timeseries`, `streams__category_timeline`, `streams__session_analysis`, `streams__category_cooccurrence`, `streams__concurrency_vs_performance` | Résumé une-ligne-par-streamer (dons/chat/viewers/uptime/diversité de catégorie en un seul endroit), nombre de viewers indexé contre la référence événementielle à cette même heure de la journée (sépare « gros à 21h » d'une performance vraiment hors norme), efficacité des dons de nuit, rang de viewers dans le temps, annotations de changement de catégorie/titre, durée/décroissance de viewers/rythme de chat/dons par session, quels jeux étaient joués simultanément sur les chaînes, concurrence vs. performance par chaîne |
+| Communauté/transversal | `community__channel_network`, `community__hourly_network`, `community__chatter_migrations`, `event__daily_rollup`, `event__phase_segmentation` | Recouvrement d'audience chaîne-à-chaîne à l'échelle de l'événement (Jaccard — quels streamers partagent effectivement une même audience), version horaire du même, graphe de flux de transferts de chaîne inférés (le meilleur proxy disponible pour la donnée de raid qu'EventSub aurait donnée), agrégation quotidienne sur l'événement, segmentation de la vélocité des dons en ouverture/milieu/dernière ligne droite |
+
+Deux choses que chaque mart de ce tableau hérite de ce qu'il y a dessous,
+qui méritent d'être répétées ici plutôt que seulement dans le commentaire
+de chaque modèle : ils représentent les chatteurs qui ont **écrit**, pas
+l'audience complète (Twitch n'expose aucune liste de viewers silencieux —
+voir [Limitations connues](#limitations-connues)), et
+`bronze_donation_goals`/`bronze_emote_catalog` sont toutes deux en
+UPSERT/état-courant, donc rien de ce qui en dérive n'a de véritable
+historique avant que la ligne n'ait été observée pour la première fois.

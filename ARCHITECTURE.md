@@ -77,8 +77,8 @@ This is what `NIFI_WEBHOOK_URL` points at (`http://<host>:8888/`).
 | (dynamic property) `stream` | `$.stream` |
 
 Promotes the envelope's `stream` field (`live_chat` / `metadata` /
-`zevent_snapshot` / `donation_goals` — see `nifi_client.push_batch`) onto the
-flowfile as an attribute, for routing.
+`zevent_snapshot` / `donation_goals` / `emote_catalog` — see
+`nifi_client.push_batch`) onto the flowfile as an attribute, for routing.
 
 Wire its `failure` relationship (fires on content that isn't valid JSON at
 all) to the dead-letter path (step 7a) too — it's auto-terminated by
@@ -91,7 +91,7 @@ by deliberately POSTing malformed JSON to `ListenHTTP` and checking
 | Relationship | Condition |
 |---|---|
 | `insert` | `${stream:in('live_chat', 'metadata', 'zevent_snapshot')}` |
-| `upsert` | `${stream:equals('donation_goals')}` |
+| `upsert` | `${stream:in('donation_goals', 'emote_catalog')}` |
 
 Unmatched flowfiles go to `unmatched` — wire that to the dead-letter path
 (step 7a) too, same as a downstream failure.
@@ -120,6 +120,18 @@ One processor handles all three INSERT-only tables via that expression
 (matches the README diagram's single `PUTDB` node) — the `stream` attribute
 survives `SplitJson` since children inherit the parent flowfile's attributes.
 
+**A schema migration that `ALTER TABLE`s one of these three existing tables
+(rather than creating a new one, like `sql/003_live_chat_chatter_attributes.sql`
+did to `bronze_live_chat`) needs a follow-up step this processor's config
+doesn't show:** its default `Table Schema Cache Size` (100) means it already
+has the table's old column list cached from earlier pushes. Applying the
+migration alone changes nothing visible — new/changed columns are silently
+dropped as unmatched fields (`Ignore Unmatched Fields`, no error, nothing in
+dead-letter) until this processor (or all of NiFi) is stopped/restarted so it
+re-reads the table's real columns. `001`/`002` never hit this, since a brand
+new table has no stale cache entry to invalidate. Confirmed on srv-dev,
+2026-08-31.
+
 ### 6b. `PutDatabaseRecord` — UPSERT branch (`upsert` relationship)
 
 | Property | Value |
@@ -127,11 +139,19 @@ survives `SplitJson` since children inherit the parent flowfile's attributes.
 | Record Reader | same `JsonTreeReader` |
 | Database Connection Pooling Service | the `DBCPConnectionPool` from step 1 |
 | Statement Type | `UPSERT` |
-| Table Name | `bronze_donation_goals` |
-| Update Keys | `participation_id, goal_id` |
+| Table Name | `${stream:equals('donation_goals'):ifElse('bronze_donation_goals', 'bronze_emote_catalog')}` |
+| Update Keys | `${stream:equals('donation_goals'):ifElse('participation_id, goal_id', 'service, scope, channel, emote_id')}` |
 
-Matches `sql/002_donation_goals.sql`'s intent: a re-poll of an existing goal
-overwrites it in place instead of appending a duplicate.
+One processor handles both UPSERT-only tables via these expressions, same
+`stream`-attribute-survives-`SplitJson` reasoning as 6a. Matches
+`sql/002_donation_goals.sql`/`sql/005_emote_catalog.sql`'s intent: a re-poll
+overwrites an existing goal/emote row in place instead of appending a
+duplicate. `bronze_emote_catalog.channel` is `NOT NULL` (a `'__global__'`
+sentinel, not `NULL`, for global-scope rows) specifically so this UPSERT's
+`ON CONFLICT` actually matches repeat global rows — Postgres treats `NULL` as
+distinct from `NULL` in a `UNIQUE` constraint, so a nullable key column here
+would silently turn every re-poll of global emotes into new duplicate inserts
+instead of in-place updates. See `sql/005_emote_catalog.sql`'s header.
 
 ### 7a. `UpdateAttribute` (unique dead-letter filename)
 
