@@ -1,0 +1,220 @@
+version: 2
+
+models:
+  - name: mart_donations__timeseries
+    description: Per-streamer + event-wide donation totals and velocity over time.
+    columns:
+      - name: donation_delta_eur
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              arguments:
+                min_value: 0
+              config:
+                severity: warn
+
+  - name: mart_donations__by_title
+    description: Donation deltas joined to the stream title/category active at that moment.
+
+  - name: mart_donation_goals__current
+    description: Current donation goals, per streamer and globally (snapshot, not a time series).
+    columns:
+      - name: participation_id
+        tests:
+          - not_null
+      - name: goal_id
+        tests:
+          - not_null
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - participation_id
+              - goal_id
+
+  - name: mart_chat__engagement_vs_donations
+    description: Chat volume vs. donation velocity per channel per hour — tests the sizing assumption behind this project's own reliability model.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - channel
+              - hour_bucket
+
+  - name: mart_chatters__leaderboard
+    description: Per-(chatter, channel) message counts with per-channel and global rank.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - chatter_id
+              - channel
+
+  - name: mart_chatters__profile
+    description: sedentaire/multi_streamer/semi_nomade/nomade classification per chatter.
+    columns:
+      - name: chatter_id
+        tests:
+          - unique
+          - not_null
+      - name: chatter_profile
+        tests:
+          - accepted_values:
+              arguments:
+                values: ["sedentaire", "multi_streamer", "semi_nomade", "nomade"]
+
+  - name: mart_community__hourly_network
+    description: Streamer-to-streamer shared-chatter network graph edges, per hour.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - hour_bucket
+              - channel_a
+              - channel_b
+
+  - name: mart_event__daily_rollup
+    description: Daily rollup — donations, viewers, chat volume — across the event.
+    columns:
+      - name: day_bucket
+        tests:
+          - unique
+          - not_null
+
+  - name: mart_chat__emote_trends
+    description: Emote usage ranked per channel per day.
+
+  - name: mart_streams__viewership_timeseries
+    description: Per-channel viewer count over time, plus rank among all channels at that hour.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - channel
+              - hour_bucket
+
+  - name: mart_streams__category_timeline
+    description: Category/title change annotations for the viewer timeline.
+
+  - name: mart_streamers__profile
+    description: One row per streamer — donations, chat, viewership, and chatter-profile mix in one place.
+    columns:
+      - name: channel
+        tests:
+          - unique
+          - not_null
+
+  - name: mart_chatters__account_age_profile
+    description: Account-age bucket per chatter, cross-tabbed against channel-count profile.
+
+  - name: mart_chatters__retention
+    description: Day-over-day chatter presence — is_new_today vs. returning.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - chatter_id
+              - day_bucket
+
+  - name: mart_chat__new_chatters_per_channel
+    description: New-to-channel chatters per day — a channel's chat-audience growth signal.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - channel
+              - day_bucket
+
+  - name: mart_chat__badge_and_verbosity
+    description: Badge/subscriber population mix and message verbosity per channel.
+    columns:
+      - name: channel
+        tests:
+          - unique
+          - not_null
+
+  - name: mart_chatters__breadth_depth_lifespan
+    description: Breadth vs. depth vs. lifespan per chatter.
+    columns:
+      - name: chatter_id
+        tests:
+          - unique
+          - not_null
+
+  - name: mart_chatters__bot_signal
+    description: Weak bot/throwaway-account signals combined (posting regularity, digit-suffixed login, account age) — not a classifier.
+    columns:
+      - name: chatter_id
+        tests:
+          - unique
+          - not_null
+
+  - name: mart_donations__normalized
+    description: Donation efficiency per average viewer / per unique chatter.
+    columns:
+      - name: twitch_login
+        tests:
+          - unique
+          - not_null
+
+  - name: mart_donations__goal_ambition_vs_reality
+    description: Sum of a streamer's goal targets vs. what they've actually raised.
+
+  - name: mart_donations__spike_moments
+    description: Top 200 donation-velocity spikes with title/category/chat-volume context.
+    columns:
+      - name: donation_delta_eur
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              arguments:
+                min_value: 0
+
+  - name: mart_donation_goals__by_category
+    description: Goal category breakdown (count, streamer count, total/avg amount).
+    columns:
+      - name: goal_category
+        tests:
+          - unique
+
+  - name: mart_donations__rank_churn
+    description: Leaderboard volatility — rank changes per streamer per snapshot.
+
+  - name: mart_donations__reconciliation
+    description: Event-wide donation total vs. sum of per-streamer amounts, per snapshot — data-quality check and a real finding (unattributed donations).
+    columns:
+      - name: snapshot_id
+        tests:
+          - unique
+          - not_null
+
+  - name: mart_streams__session_analysis
+    description: Duration distribution, viewer decay, chat pace, and donations per broadcast session.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - channel
+              - stream_started_at
+
+  - name: mart_chat__spikes
+    description: Hours where a channel's own message count is >=2 stddev above its own average.
+
+  - name: mart_community__channel_network
+    description: Filtered channel-to-channel Jaccard overlap (shared_chatter_count >= 3) — audience communities/clusters input.
+
+  - name: mart_community__chatter_migrations
+    description: Directed flow graph of inferred channel-hops — closest available proxy to raid data.
+
+  - name: mart_streams__category_cooccurrence
+    description: Per-category "share of event" — how many channels played the same game at the same hour.
+
+  - name: mart_streams__concurrency_vs_performance
+    description: Per-channel viewer count next to total live-channel count at the same hour.
+
+  - name: mart_streamers__diurnal_profile
+    description: Per-streamer viewer count indexed against the event-wide average at the same hour-of-day.
+
+  - name: mart_streamers__night_shift
+    description: Donation-per-viewer efficiency by hour-of-day, flagging overnight hours.
+
+  - name: mart_event__phase_segmentation
+    description: Opening/middle/final-push donation velocity by relative position in the observed time span.
