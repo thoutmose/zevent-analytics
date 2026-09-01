@@ -9,7 +9,9 @@
 -- "final_push" describe the observed window, not necessarily the real
 -- event's actual open/close.
 with event_bounds as (
-    select min(ingested_at) as event_start, max(ingested_at) as event_end
+    select
+        min(ingested_at) as event_start,
+        max(ingested_at) as event_end
     from {{ ref('int_donations__streamer_deltas') }}
 ),
 
@@ -19,7 +21,7 @@ donations_with_phase as (
         d.ingested_at,
         d.donation_delta_eur,
         extract(epoch from (d.ingested_at - eb.event_start))
-            / nullif(extract(epoch from (eb.event_end - eb.event_start)), 0)
+        / nullif(extract(epoch from (eb.event_end - eb.event_start)), 0)
             as event_progress_pct
     from {{ ref('int_donations__streamer_deltas') }} as d
     cross join event_bounds as eb

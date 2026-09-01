@@ -27,6 +27,7 @@ select
     message_sent_at as arrived_at,
     extract(epoch from (message_sent_at - prev_message_sent_at)) as gap_seconds
 from ordered
-where channel != prev_channel
+where
+    channel != prev_channel
     and message_sent_at - prev_message_sent_at
-        <= interval '{{ var("chatter_migration_max_gap_minutes") }} minutes'
+    <= interval '{{ var("chatter_migration_max_gap_minutes") }} minutes'

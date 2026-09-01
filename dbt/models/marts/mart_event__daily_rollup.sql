@@ -21,11 +21,11 @@ donations_daily as (
 )
 
 select
-    coalesce(c.day_bucket, d.day_bucket) as day_bucket,
     c.message_count,
     c.active_channels,
     d.donation_delta_eur,
     d.total_donation_amount_eur_end_of_day,
-    d.avg_total_viewer_count
+    d.avg_total_viewer_count,
+    coalesce(c.day_bucket, d.day_bucket) as day_bucket
 from chat_daily as c
 full outer join donations_daily as d on c.day_bucket = d.day_bucket

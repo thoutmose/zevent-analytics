@@ -8,10 +8,10 @@ select
     chatter,
     distinct_channel_count,
     total_message_count,
-    round(total_message_count::numeric / nullif(distinct_channel_count, 0), 1)
-        as avg_messages_per_channel,
     first_message_at,
     last_message_at,
     lifespan_seconds,
+    round(total_message_count::numeric / nullif(distinct_channel_count, 0), 1)
+        as avg_messages_per_channel,
     round(lifespan_seconds / 3600.0, 1) as lifespan_hours
 from {{ ref('int_chat__chatter_activity') }}

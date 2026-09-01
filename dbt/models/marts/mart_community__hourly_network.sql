@@ -13,7 +13,8 @@ select
     sum(least(a.message_count, b.message_count)) as min_message_overlap
 from {{ ref('int_community__hourly_chatter_streamer_edges') }} as a
 inner join {{ ref('int_community__hourly_chatter_streamer_edges') }} as b
-    on a.chatter_id = b.chatter_id
-    and a.hour_bucket = b.hour_bucket
-    and a.channel < b.channel
+    on
+        a.chatter_id = b.chatter_id
+        and a.hour_bucket = b.hour_bucket
+        and a.channel < b.channel
 group by 1, 2, 3

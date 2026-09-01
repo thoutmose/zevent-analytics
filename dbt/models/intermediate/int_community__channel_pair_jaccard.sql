@@ -5,7 +5,9 @@
 -- which are isolated islands — something only possible because this project
 -- ingests all ~300+ channels at once rather than one.
 with chatter_channels as (
-    select distinct chatter_id, channel
+    select distinct
+        chatter_id,
+        channel
     from {{ ref('stg_bronze__live_chat') }}
     where chatter_id is not null
 ),
@@ -22,7 +24,9 @@ pair_overlap as (
 ),
 
 channel_totals as (
-    select channel, count(distinct chatter_id) as chatter_count
+    select
+        channel,
+        count(distinct chatter_id) as chatter_count
     from chatter_channels
     group by 1
 )
@@ -34,8 +38,8 @@ select
     ta.chatter_count as channel_a_chatter_count,
     tb.chatter_count as channel_b_chatter_count,
     p.shared_chatter_count::numeric
-        / nullif(ta.chatter_count + tb.chatter_count - p.shared_chatter_count, 0)
+    / nullif(ta.chatter_count + tb.chatter_count - p.shared_chatter_count, 0)
         as jaccard_index
 from pair_overlap as p
-inner join channel_totals as ta on ta.channel = p.channel_a
-inner join channel_totals as tb on tb.channel = p.channel_b
+inner join channel_totals as ta on p.channel_a = ta.channel
+inner join channel_totals as tb on p.channel_b = tb.channel

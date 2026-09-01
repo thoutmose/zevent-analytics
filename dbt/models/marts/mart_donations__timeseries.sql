@@ -6,15 +6,15 @@ select
     twitch_login,
     display_name,
     game,
-    online,
+    is_online,
     viewer_count,
     donation_amount_eur,
     donation_delta_eur,
     total_donation_amount_eur,
     total_viewer_count,
     ingested_at,
-    date_trunc('day', ingested_at) as day_bucket,
     seconds_since_prev_snapshot,
+    date_trunc('day', ingested_at) as day_bucket,
     case
         when seconds_since_prev_snapshot > 0
             then donation_delta_eur / (seconds_since_prev_snapshot / 60.0)

@@ -10,7 +10,7 @@ with identity as (
         display_name
     from {{ ref('stg_bronze__zevent_snapshots') }}
     where twitch_login is not null
-    order by twitch_login, snapshot_id desc
+    order by twitch_login asc, snapshot_id desc
 ),
 
 donations as (
@@ -19,7 +19,7 @@ donations as (
         max(donation_amount_eur) as latest_donation_amount_eur,
         sum(case when donation_delta_eur > 0 then donation_delta_eur else 0 end) as donation_delta_sum_eur
     from {{ ref('int_donations__streamer_deltas') }}
-    group by 1
+    group by twitch_login
 ),
 
 chat_totals as (
@@ -28,7 +28,7 @@ chat_totals as (
         count(*) as unique_chatter_count,
         sum(message_count) as total_message_count
     from {{ ref('int_chat__chatter_channel_activity') }}
-    group by 1
+    group by channel
 ),
 
 chatter_profile_mix as (
@@ -37,8 +37,8 @@ chatter_profile_mix as (
         p.chatter_profile,
         count(*) as chatter_count
     from {{ ref('int_chat__chatter_channel_activity') }} as a
-    inner join {{ ref('mart_chatters__profile') }} as p on p.chatter_id = a.chatter_id
-    group by 1, 2
+    inner join {{ ref('mart_chatters__profile') }} as p on a.chatter_id = p.chatter_id
+    group by a.channel, p.chatter_profile
 ),
 
 chatter_profile_pivot as (
@@ -49,7 +49,7 @@ chatter_profile_pivot as (
         sum(chatter_count) filter (where chatter_profile = 'semi_nomade') as semi_nomade_chatter_count,
         sum(chatter_count) filter (where chatter_profile = 'nomade') as nomade_chatter_count
     from chatter_profile_mix
-    group by 1
+    group by channel
 ),
 
 viewership as (
@@ -61,7 +61,7 @@ viewership as (
         avg(avg_viewer_count) as avg_viewer_count,
         max(peak_viewer_count) as peak_viewer_count
     from {{ ref('int_streams__sessions') }}
-    group by 1, 2
+    group by channel, broadcaster_id
 ),
 
 top_category as (
@@ -69,19 +69,24 @@ top_category as (
         channel,
         category as top_category
     from (
-        select channel, category, count(*) as snapshot_count
+        select
+            channel,
+            category,
+            count(*) as snapshot_count
         from {{ ref('stg_bronze__metadata_snapshots') }}
         where category is not null
-        group by 1, 2
+        group by channel, category
     ) as ranked
-    order by channel, snapshot_count desc
+    order by channel asc, snapshot_count desc
 ),
 
 category_diversity as (
-    select channel, count(distinct category) as category_diversity_score
+    select
+        channel,
+        count(distinct category) as category_diversity_score
     from {{ ref('stg_bronze__metadata_snapshots') }}
     where category is not null
-    group by 1
+    group by channel
 ),
 
 -- Uptime denominator: the observed data's own time span, not a hardcoded
@@ -108,14 +113,14 @@ select
     v.total_stream_duration_seconds,
     v.avg_viewer_count,
     v.peak_viewer_count,
-    v.total_stream_duration_seconds / nullif(ow.observed_seconds, 0) as uptime_pct,
     tc.top_category,
-    cd.category_diversity_score
+    cd.category_diversity_score,
+    v.total_stream_duration_seconds / nullif(ow.observed_seconds, 0) as uptime_pct
 from identity as i
-left join donations as d on d.twitch_login = i.twitch_login
-left join chat_totals as ct on ct.channel = i.twitch_login
-left join chatter_profile_pivot as cp on cp.channel = i.twitch_login
-left join viewership as v on v.channel = i.twitch_login
-left join top_category as tc on tc.channel = i.twitch_login
-left join category_diversity as cd on cd.channel = i.twitch_login
+left join donations as d on i.twitch_login = d.twitch_login
+left join chat_totals as ct on i.twitch_login = ct.channel
+left join chatter_profile_pivot as cp on i.twitch_login = cp.channel
+left join viewership as v on i.twitch_login = v.channel
+left join top_category as tc on i.twitch_login = tc.channel
+left join category_diversity as cd on i.twitch_login = cd.channel
 cross join observed_window as ow

@@ -16,4 +16,4 @@ select
         else '3yr+'
     end as account_age_bucket
 from {{ ref('int_chat__chatter_activity') }} as ca
-left join {{ ref('mart_chatters__profile') }} as p on p.chatter_id = ca.chatter_id
+left join {{ ref('mart_chatters__profile') }} as p on ca.chatter_id = p.chatter_id

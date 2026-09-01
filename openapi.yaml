@@ -3,13 +3,24 @@ info:
   title: Zevent Multi-Channel Extractor — External API
   version: "2.0.0"
   description: |
-    Every external HTTP/WS call this repo's `main.py` and `zevent_api.py` make (or could make)
-    while watching every Twitch channel in the current Zevent roster (300+) at once.
+    Every external HTTP/WS call this repo's `main.py`, `zevent_api.py`, and `emote_catalog.py`
+    make (or could make) while watching every Twitch channel in the current Zevent roster (300+)
+    at once.
 
     Chat isn't in this document at all: `main.py` reads it over anonymous Twitch IRC
     (`wss://irc-ws.chat.twitch.tv:443`, no auth, `justinfan<random>` nick), sharded across
     several connections (`CHANNELS_PER_IRC_CONNECTION`) — that's a raw IRC-over-WebSocket
-    protocol, not a REST/EventSub call, so there's nothing to describe as an OpenAPI path.
+    protocol, not a REST/EventSub call, so there's nothing to describe as an OpenAPI path. Native
+    Twitch emote *usage* is likewise just an IRC tag on each chat message, parsed in-process
+    (`main.py`'s `_parse_emotes`) — nothing to call. The emote *catalog* endpoints below (what
+    emotes exist, not who used them) are real HTTP calls, made by the separate `emote_catalog.py`
+    poller — see its module docstring for why that's a separate process rather than living in
+    `main.py`.
+
+    Third-party emote services (7TV, BetterTTV, FrankerFaceZ) get their own `security: []`
+    Public-tier tags below, same as Zevent's own API: none of the three need a Twitch app
+    token, only a broadcaster_id (7TV/BetterTTV) or Twitch login (FrankerFaceZ) already
+    resolved via Get Users.
 
     **A naming note** on `/eventsub/subscriptions` below (kept as `x-status: dropped`, see
     that entry): it has nothing to do with the paid "channel Subscriptions" feature. Twitch
@@ -38,6 +49,12 @@ tags:
     description: Requires the authorizing account to be the channel's broadcaster or a moderator.
   - name: Zevent
     description: Public, unauthenticated JSON — every registered streamer at once.
+  - name: 7TV
+    description: Public, unauthenticated JSON — no Twitch scope, no API key of its own.
+  - name: BetterTTV
+    description: Public, unauthenticated JSON — no Twitch scope, no API key of its own.
+  - name: FrankerFaceZ
+    description: Public, unauthenticated JSON — no Twitch scope, no API key of its own.
 
 components:
   securitySchemes:
@@ -68,6 +85,11 @@ paths:
       x-used-by: >
         main.py:242 — once at startup (event_ready), one call per 100-channel chunk of the
         roster, to resolve every channel's broadcaster_id before joining IRC/polling streams.
+        Also main.py's _chatter_lookup_loop, every CHATTER_LOOKUP_INTERVAL_SECONDS (default
+        30s), one call per 100 chatter_ids, to resolve account_created_at/broadcaster_type for
+        chatters seen in chat but not yet cached (see ChatterInfo/chatter_cache). And
+        emote_catalog.py's _resolve_broadcaster_ids, once per poll, to translate the roster's
+        Twitch logins into the broadcaster_ids 7TV/BetterTTV key their catalogs by.
       parameters:
         - name: login
           in: query
@@ -91,6 +113,68 @@ paths:
                     offline_image_url: ""
                     view_count: 0
                     created_at: "2015-05-13T18:14:52Z"
+
+  /chat/emotes/global:
+    get:
+      operationId: getGlobalChatEmotes
+      tags: [Twitch Helix — Public]
+      summary: Get Global Emotes
+      description: >
+        Every emote available in any channel's chat regardless of subscription (Kappa and
+        friends). Emote *usage* is a free IRC tag (see the document description above) — this
+        is the separate "what emotes exist" catalog side, fetched once per poll rather than
+        derived from any message.
+      x-status: in-use
+      x-used-by: >
+        emote_catalog.py:194 (fetch_twitch_global_emotes) — once per poll
+        (EMOTE_CATALOG_POLL_INTERVAL_SECONDS, default 1800s), alongside the equivalent 7TV/
+        BetterTTV/FrankerFaceZ global-emote calls.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - id: "425618"
+                    name: Kappa
+                    images: { url_1x: "https://static-cdn.jtvnw.net/emoticons/v2/425618/static/light/1.0" }
+                  - id: "88"
+                    name: PogChamp
+                    images: { url_1x: "https://static-cdn.jtvnw.net/emoticons/v2/88/static/light/1.0" }
+                template: "https://static-cdn.jtvnw.net/emoticons/v2/{{id}}/{{format}}/{{theme_mode}}/{{scale}}"
+
+  /chat/emotes:
+    get:
+      operationId: getChannelChatEmotes
+      tags: [Twitch Helix — Public]
+      summary: Get Channel Emotes
+      description: >
+        A channel's own subscriber/bits/follower emotes — the channel-scoped counterpart to Get
+        Global Emotes above.
+      x-status: in-use
+      x-used-by: >
+        emote_catalog.py:206 (fetch_twitch_channel_emotes) — one call per roster channel per
+        poll, concurrency-bounded by EMOTE_CATALOG_MAX_CONCURRENCY (default 10).
+      parameters:
+        - name: broadcaster_id
+          in: query
+          required: true
+          schema: { type: string }
+          description: Use the broadcaster_id already resolved via Get Users.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                data:
+                  - id: "302976485"
+                    name: zrtTap
+                    images: { url_1x: "https://static-cdn.jtvnw.net/emoticons/v2/302976485/static/light/1.0" }
+                    emote_type: subscriptions
+                    tier: "1000"
+                template: "https://static-cdn.jtvnw.net/emoticons/v2/{{id}}/{{format}}/{{theme_mode}}/{{scale}}"
 
   /streams:
     get:
@@ -588,3 +672,170 @@ paths:
                     game: Just Chatting
                     viewersAmount: { number: 4144 }
                     donationAmount: { number: 15230.5 }
+
+  /v3/emote-sets/global:
+    servers:
+      - url: https://7tv.io
+        description: 7TV
+    get:
+      operationId: get7tvGlobalEmotes
+      tags: [7TV]
+      security: []
+      summary: Get Global Emote Set
+      description: 7TV's global emote set, usable in any channel that has 7TV enabled.
+      x-status: in-use
+      x-used-by: >
+        emote_catalog.py:225 (fetch_7tv_global_emotes) — once per poll.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                emotes:
+                  - id: "60ae5b45b7d0ce0d295a1461"
+                    name: EZ
+
+  /v3/users/twitch/{broadcaster_id}:
+    servers:
+      - url: https://7tv.io
+        description: 7TV
+    get:
+      operationId: get7tvChannelEmotes
+      tags: [7TV]
+      security: []
+      summary: Get User's Emote Set (by Twitch ID)
+      description: >
+        A channel's own 7TV emote set. 404 means the channel never linked a 7TV account —
+        not an error, most Zevent channels have zero 7TV rows.
+      x-status: in-use
+      x-used-by: >
+        emote_catalog.py:236 (fetch_7tv_channel_emotes) — one call per roster channel per poll,
+        concurrency-bounded by EMOTE_CATALOG_MAX_CONCURRENCY.
+      parameters:
+        - name: broadcaster_id
+          in: path
+          required: true
+          schema: { type: string }
+          description: Twitch broadcaster_id, resolved via Get Users.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                emote_set: { emotes: [{ id: "01FS5ZCFG0000500DPPCXJWCP8", name: o7 }] }
+        "404":
+          description: Channel has no 7TV account linked.
+
+  /3/cached/emotes/global:
+    servers:
+      - url: https://api.betterttv.net
+        description: BetterTTV
+    get:
+      operationId: getBttvGlobalEmotes
+      tags: [BetterTTV]
+      security: []
+      summary: Get Global Emotes
+      description: BetterTTV's global emote set, usable in any channel that has BetterTTV enabled.
+      x-status: in-use
+      x-used-by: >
+        emote_catalog.py:255 (fetch_bttv_global_emotes) — once per poll.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                - id: "54fa8f1401e468494b85b537"
+                  code: ":tf:"
+
+  /3/cached/users/twitch/{broadcaster_id}:
+    servers:
+      - url: https://api.betterttv.net
+        description: BetterTTV
+    get:
+      operationId: getBttvChannelEmotes
+      tags: [BetterTTV]
+      security: []
+      summary: Get User (by Twitch ID)
+      description: >
+        A channel's own channelEmotes + sharedEmotes (emotes shared into the channel from
+        elsewhere). 404 means the channel never linked a BetterTTV account.
+      x-status: in-use
+      x-used-by: >
+        emote_catalog.py:264 (fetch_bttv_channel_emotes) — one call per roster channel per poll,
+        concurrency-bounded by EMOTE_CATALOG_MAX_CONCURRENCY.
+      parameters:
+        - name: broadcaster_id
+          in: path
+          required: true
+          schema: { type: string }
+          description: Twitch broadcaster_id, resolved via Get Users.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                channelEmotes: [{ id: "5f1b0186cf6d2144653d2970", code: pepeD }]
+                sharedEmotes: []
+        "404":
+          description: Channel has no BetterTTV account linked.
+
+  /v1/set/global:
+    servers:
+      - url: https://api.frankerfacez.com
+        description: FrankerFaceZ
+    get:
+      operationId: getFfzGlobalEmotes
+      tags: [FrankerFaceZ]
+      security: []
+      summary: Get Global Set
+      description: >
+        FrankerFaceZ's global emote sets. Nested under sets[set_id].emoticons rather than a
+        flat list — default_sets says which set ids are actually global (see
+        emote_catalog.py's _flatten_ffz_sets).
+      x-status: in-use
+      x-used-by: >
+        emote_catalog.py:283 (fetch_ffz_global_emotes) — once per poll.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                default_sets: [3]
+                sets: { "3": { emoticons: [{ id: 28136, name: LULW }] } }
+
+  /v1/room/{channel}:
+    servers:
+      - url: https://api.frankerfacez.com
+        description: FrankerFaceZ
+    get:
+      operationId: getFfzRoomEmotes
+      tags: [FrankerFaceZ]
+      security: []
+      summary: Get Room
+      description: >
+        A channel's own FrankerFaceZ emote sets — keyed by Twitch *login*, unlike 7TV/BetterTTV
+        above which key by broadcaster_id. 404 means the channel never linked an FFZ account.
+      x-status: in-use
+      x-used-by: >
+        emote_catalog.py:293 (fetch_ffz_channel_emotes) — one call per roster channel per poll,
+        concurrency-bounded by EMOTE_CATALOG_MAX_CONCURRENCY.
+      parameters:
+        - name: channel
+          in: path
+          required: true
+          schema: { type: string }
+          description: Twitch login (not broadcaster_id).
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                sets: { "12345": { emoticons: [{ id: 33355, name: FeelsBadMan }] } }
+        "404":
+          description: Channel has no FrankerFaceZ room configured.

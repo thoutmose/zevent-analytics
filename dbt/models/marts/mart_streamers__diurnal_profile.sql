@@ -30,4 +30,4 @@ select
     e.event_avg_viewer_count,
     s.streamer_avg_viewer_count / nullif(e.event_avg_viewer_count, 0) as viewer_index_vs_event
 from streamer_hourly as s
-inner join event_hourly as e on e.hour_of_day = s.hour_of_day
+inner join event_hourly as e on s.hour_of_day = e.hour_of_day

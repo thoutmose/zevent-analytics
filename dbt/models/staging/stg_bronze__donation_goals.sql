@@ -3,12 +3,12 @@
 select
     participation_id,
     streamer_name,
-    lower(twitch_login) as twitch_login,
     twitch_id,
     goal_id,
     goal_name,
     goal_amount_eur,
     goal_category,
     snapshot_at,
-    ingested_at
+    ingested_at,
+    lower(twitch_login) as twitch_login
 from {{ source('bronze', 'bronze_donation_goals') }}

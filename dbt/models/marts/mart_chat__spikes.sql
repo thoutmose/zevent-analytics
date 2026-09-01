@@ -24,5 +24,6 @@ select
     channel_stddev_message_count,
     (message_count - channel_avg_message_count) / channel_stddev_message_count as message_count_zscore
 from stats
-where channel_stddev_message_count > 0
+where
+    channel_stddev_message_count > 0
     and (message_count - channel_avg_message_count) / channel_stddev_message_count >= 2
