@@ -25,5 +25,5 @@ set +a
 
 export DBT_TARGET="${DBT_TARGET:-prod}"
 
-uv run --group dbt --project-dir dbt --profiles-dir dbt dbt deps
-uv run --group dbt --project-dir dbt --profiles-dir dbt dbt build
+/home/thoutmose/.local/bin/uv run --group dbt -- dbt deps --project-dir dbt --profiles-dir dbt
+/home/thoutmose/.local/bin/uv run --group dbt -- dbt build --project-dir dbt --profiles-dir dbt
