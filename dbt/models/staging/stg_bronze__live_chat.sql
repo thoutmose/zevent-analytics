@@ -13,9 +13,9 @@ select
     message_sent_at,
     captured_at,
     badges,
-    nullif(user_type, '') as user_type,
     emotes,
     account_created_at,
-    nullif(broadcaster_type, '') as broadcaster_type,
-    ingested_at
+    ingested_at,
+    nullif(user_type, '') as user_type,
+    nullif(broadcaster_type, '') as broadcaster_type
 from {{ source('bronze', 'bronze_live_chat') }}

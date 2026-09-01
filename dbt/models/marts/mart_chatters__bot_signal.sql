@@ -28,4 +28,4 @@ select
             then r.stddev_gap_seconds / r.avg_gap_seconds
     end as gap_coefficient_of_variation
 from {{ ref('int_chat__chatter_activity') }} as ca
-left join regularity as r on r.chatter_id = ca.chatter_id
+left join regularity as r on ca.chatter_id = r.chatter_id

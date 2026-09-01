@@ -30,5 +30,6 @@ select
     prev_viewer_count,
     viewer_count as viewer_count_at_change
 from ordered
-where category is distinct from prev_category
+where
+    category is distinct from prev_category
     or title is distinct from prev_title

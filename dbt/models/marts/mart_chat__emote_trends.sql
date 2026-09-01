@@ -3,9 +3,9 @@
 -- resolution for "trending" rather than hour-by-hour noise.
 select
     channel,
-    date_trunc('day', hour_bucket) as day_bucket,
     service,
     emote_id,
+    date_trunc('day', hour_bucket) as day_bucket,
     sum(usage_count) as usage_count,
     rank() over (
         partition by channel, date_trunc('day', hour_bucket)

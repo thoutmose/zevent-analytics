@@ -8,5 +8,5 @@ select
     c.live_channel_count,
     c.total_avg_viewer_count
 from {{ ref('int_streams__hourly_viewership') }} as v
-inner join {{ ref('int_streams__concurrency') }} as c on c.hour_bucket = v.hour_bucket
+inner join {{ ref('int_streams__concurrency') }} as c on v.hour_bucket = c.hour_bucket
 where v.live_snapshot_count > 0

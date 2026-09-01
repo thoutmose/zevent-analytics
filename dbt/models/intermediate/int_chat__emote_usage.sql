@@ -23,12 +23,12 @@ with native as (
 
 third_party_tokens as (
     select
-        channel,
-        date_trunc('hour', message_sent_at) as hour_bucket,
-        token
-    from {{ ref('stg_bronze__live_chat') }}
-    cross join lateral regexp_split_to_table(message_text, '\s+') as token
-    where message_text is not null and message_text != ''
+        lc.channel,
+        token.token,
+        date_trunc('hour', lc.message_sent_at) as hour_bucket
+    from {{ ref('stg_bronze__live_chat') }} as lc
+    cross join lateral regexp_split_to_table(lc.message_text, '\s+') as token
+    where lc.message_text is not null and lc.message_text != ''
 ),
 
 third_party as (
@@ -40,9 +40,10 @@ third_party as (
         count(*) as usage_count
     from third_party_tokens as t
     inner join {{ ref('stg_bronze__emote_catalog') }} as ec
-        on ec.emote_code = t.token
-        and ec.service in ('7tv', 'bttv', 'ffz')
-        and (ec.channel = t.channel or ec.channel = '__global__')
+        on
+            t.token = ec.emote_code
+            and ec.service in ('7tv', 'bttv', 'ffz')
+            and (t.channel = ec.channel or ec.channel = '__global__')
     group by 1, 2, 3, 4
 )
 

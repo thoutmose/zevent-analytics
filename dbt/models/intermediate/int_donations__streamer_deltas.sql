@@ -8,7 +8,7 @@ with ordered as (
         twitch_login,
         display_name,
         game,
-        online,
+        is_online,
         viewer_count,
         donation_amount_eur,
         -- Event-wide totals, denormalized here from the parent snapshot
@@ -32,7 +32,7 @@ select
     twitch_login,
     display_name,
     game,
-    online,
+    is_online,
     viewer_count,
     donation_amount_eur,
     total_donation_amount_eur,

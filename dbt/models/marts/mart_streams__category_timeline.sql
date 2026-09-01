@@ -13,5 +13,6 @@ select
     v.avg_viewer_count as avg_viewer_count_hour_after
 from {{ ref('int_streams__category_changes') }} as c
 left join {{ ref('int_streams__hourly_viewership') }} as v
-    on v.channel = c.channel
-    and v.hour_bucket = date_trunc('hour', c.changed_at) + interval '1 hour'
+    on
+        c.channel = v.channel
+        and v.hour_bucket = date_trunc('hour', c.changed_at) + interval '1 hour'

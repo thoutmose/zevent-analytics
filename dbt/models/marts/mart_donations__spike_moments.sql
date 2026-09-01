@@ -22,16 +22,20 @@ select
     c.message_count as chat_messages_that_hour
 from spikes as s
 left join lateral (
-    select ms.title, ms.category
+    select
+        ms.title,
+        ms.category
     from {{ ref('stg_bronze__metadata_snapshots') }} as ms
-    where ms.channel = s.twitch_login
+    where
+        ms.channel = s.twitch_login
         and ms.snapshot_at <= s.ingested_at
         and ms.snapshot_at >= s.ingested_at - interval '5 minutes'
     order by ms.snapshot_at desc
     limit 1
 ) as m on true
 left join {{ ref('int_chat__hourly_channel_activity') }} as c
-    on c.channel = s.twitch_login
-    and c.hour_bucket = date_trunc('hour', s.ingested_at)
+    on
+        s.twitch_login = c.channel
+        and c.hour_bucket = date_trunc('hour', s.ingested_at)
 order by s.donation_delta_eur desc
 limit 200

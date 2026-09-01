@@ -11,7 +11,9 @@ with streamer_totals as (
 ),
 
 chat_totals as (
-    select channel, count(*) as unique_chatter_count
+    select
+        channel,
+        count(*) as unique_chatter_count
     from {{ ref('int_chat__chatter_channel_activity') }}
     group by 1
 )
@@ -26,4 +28,4 @@ select
     st.latest_donation_amount_eur / nullif(ct.unique_chatter_count, 0)
         as donation_eur_per_unique_chatter
 from streamer_totals as st
-left join chat_totals as ct on ct.channel = st.twitch_login
+left join chat_totals as ct on st.twitch_login = ct.channel

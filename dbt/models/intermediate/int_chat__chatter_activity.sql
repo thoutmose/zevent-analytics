@@ -16,7 +16,7 @@ with latest_attrs as (
         broadcaster_type
     from {{ ref('stg_bronze__live_chat') }}
     where chatter_id is not null
-    order by chatter_id, message_sent_at desc
+    order by chatter_id asc, message_sent_at desc
 ),
 
 aggregates as (
@@ -29,7 +29,7 @@ aggregates as (
         avg(length(message_text)) as avg_message_length
     from {{ ref('stg_bronze__live_chat') }}
     where chatter_id is not null
-    group by 1
+    group by chatter_id
 )
 
 select
@@ -41,8 +41,8 @@ select
     a.total_message_count,
     a.first_message_at,
     a.last_message_at,
-    extract(epoch from (a.last_message_at - a.first_message_at)) as lifespan_seconds,
     a.avg_message_length,
+    extract(epoch from (a.last_message_at - a.first_message_at)) as lifespan_seconds,
     (la.chatter ~ '[0-9]{4,}$') as has_long_digit_suffix
 from aggregates as a
-inner join latest_attrs as la on la.chatter_id = a.chatter_id
+inner join latest_attrs as la on a.chatter_id = la.chatter_id

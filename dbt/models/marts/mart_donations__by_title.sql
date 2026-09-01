@@ -20,9 +20,12 @@ select
     m.category
 from donations as d
 left join lateral (
-    select ms.title, ms.category
+    select
+        ms.title,
+        ms.category
     from {{ ref('stg_bronze__metadata_snapshots') }} as ms
-    where ms.channel = d.twitch_login
+    where
+        ms.channel = d.twitch_login
         and ms.snapshot_at <= d.ingested_at
         and ms.snapshot_at >= d.ingested_at - interval '5 minutes'
     order by ms.snapshot_at desc

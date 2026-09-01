@@ -4,8 +4,8 @@
 -- whether a game trending across many channels at once coincided with a
 -- viewer or donation lift.
 select
-    date_trunc('hour', snapshot_at) as hour_bucket,
     category,
+    date_trunc('hour', snapshot_at) as hour_bucket,
     count(distinct channel) as channel_count_playing
 from {{ ref('stg_bronze__metadata_snapshots') }}
 where is_live and category is not null
