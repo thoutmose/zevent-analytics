@@ -24,11 +24,27 @@ services:
       NIFI_WEB_PROXY_HOST: ${NIFI_WEB_PROXY_HOST:-nifi.thoutmose.me}
       SINGLE_USER_CREDENTIALS_USERNAME: ${NIFI_ADMIN_USERNAME:-admin}
       SINGLE_USER_CREDENTIALS_PASSWORD: ${NIFI_ADMIN_PASSWORD:?set NIFI_ADMIN_PASSWORD in .env (min 12 chars)}
+      # Stock image default (512m/512m, set in bootstrap.conf) starts GC-thrashing well
+      # before Zevent-scale load (6000+ TPS, thousands of in-flight flowfiles post-
+      # SplitJson). Sized for a 16 GB srv-prod host: 8g max leaves the rest for the OS
+      # page cache the content/provenance repositories lean on, not a hard requirement —
+      # lower if the host doesn't have it. See ARCHITECTURE.md, "Tuning for higher
+      # throughput".
+      NIFI_JVM_HEAP_INIT: ${NIFI_JVM_HEAP_INIT:-4g}
+      NIFI_JVM_HEAP_MAX: ${NIFI_JVM_HEAP_MAX:-8g}
+    # The stock entrypoint (scripts/start.sh) doesn't expose an env var for provenance
+    # repository retention, so tune-provenance-retention.sh patches nifi.properties
+    # before handing off to it. Without this, provenance defaults to 30 days / 10 GB —
+    # it was previously an unmapped anonymous volume, invisible to `docker volume ls`
+    # and untouched by the compress/archive process, quietly heading for 10 GB.
+    entrypoint: ["/bin/sh", "/opt/nifi/tune-provenance-retention.sh"]
     volumes:
       - nifi-state:/opt/nifi/nifi-current/state
       - nifi-flowfile:/opt/nifi/nifi-current/flowfile_repository
       - nifi-content:/opt/nifi/nifi-current/content_repository
+      - nifi-provenance:/opt/nifi/nifi-current/provenance_repository
       - ./nifi/dead-letter:/opt/nifi/dead-letter
+      - ./nifi/tune-provenance-retention.sh:/opt/nifi/tune-provenance-retention.sh:ro
       # PostgreSQL JDBC driver for PutDatabaseRecord's DBCPConnectionPool controller
       # service — not bundled in the stock NiFi image (see ARCHITECTURE.md §2.A step 4).
       - ./drivers:/opt/nifi/nifi-current/drivers:ro
@@ -38,3 +54,4 @@ volumes:
   nifi-state:
   nifi-flowfile:
   nifi-content:
+  nifi-provenance:

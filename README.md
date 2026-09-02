@@ -11,9 +11,12 @@
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-4169E1?logo=postgresql&logoColor=white)
 ![PgBouncer](https://img.shields.io/badge/PgBouncer-connection%20pooling-4169E1)
 ![Docker Compose](https://img.shields.io/badge/Docker%20Compose-NiFi%20stack-2496ED?logo=docker&logoColor=white)
+![dbt](https://img.shields.io/badge/dbt-transformation-FF694B?logo=dbt&logoColor=white)
 ![Ruff](https://img.shields.io/badge/lint%20%2F%20format-Ruff-D7FF64?logo=ruff&logoColor=black)
 ![ty](https://img.shields.io/badge/type%20check-ty-FCA121)
 [![CI](https://github.com/thoutmose/zevent-analytics/actions/workflows/ci.yml/badge.svg)](https://github.com/thoutmose/zevent-analytics/actions/workflows/ci.yml)
+
+**[English](README.md) · [Français](README.fr.md)**
 
 Extracts live-stream data for every Twitch channel participating in
 [Zevent](https://zevent.fr/) — chat, viewer counts, stream metadata, and the
@@ -134,9 +137,9 @@ flowchart LR
     ZAPI -- NIFI_WEBHOOK_URL --> LISTEN
     DGOAL -- NIFI_WEBHOOK_URL --> LISTEN
     ECAT -- NIFI_WEBHOOK_URL --> LISTEN
-    LISTEN --> EJP --> MERGE --> ROUTE --> SPLIT
+    LISTEN --> EJP --> ROUTE --> SPLIT
     SPLIT -- "stream in (donation_goals, emote_catalog)" --> PUTDBUP
-    SPLIT -- every other stream --> PUTDB
+    SPLIT -- every other stream --> MERGE --> PUTDB
     PUTDB -- success --> PG
     PUTDB -- failure --> DEADLETTER
     PUTDBUP -- success --> PG
@@ -175,15 +178,29 @@ is the ingestion path every batch from all four extractors takes:
    into one flowfile per row. Each row already carries its own `batch_id` +
    `row_number` (set Python-side, see `nifi_client.py`) — that's what makes
    a re-sent batch idempotent at the database layer, not anything NiFi does.
-5. **`PutDatabaseRecord`** (one per branch) — the sink. The INSERT branch
-   picks its target table (`bronze_live_chat` / `bronze_metadata_snapshots` /
-   `bronze_zevent_snapshots`) with a NiFi Expression Language ternary on the
-   `stream` attribute, so one processor covers three tables instead of three
-   near-identical ones. The UPSERT branch does the same thing between its two
+5. **`MergeContent`** (insert branch only) — re-assembles same-`stream` rows
+   that step 4 just split apart back into a batched JSON array, so
+   `PutDatabaseRecord` issues one JDBC batch insert per bin instead of one
+   row at a time. The upsert branch skips straight from `SplitJson` to
+   `PutDatabaseRecord` — donation_goals/emote_catalog poll volume doesn't
+   need it. See [`ARCHITECTURE.md`, step
+   5b](ARCHITECTURE.md#5b-mergecontent--insert-branch-only-between-splitjson-insert-and-putdatabaserecord-insert).
+6. **`PutDatabaseRecord`** (one per branch) — the sink. The INSERT branch
+   picks its target table (`bronze_live_chat_staging` for `live_chat` /
+   `bronze_metadata_snapshots` / `bronze_zevent_snapshots`) with a NiFi
+   Expression Language ternary on the `stream` attribute, so one processor
+   covers three tables instead of three near-identical ones — `live_chat`
+   lands in an `UNLOGGED` staging table instead of `bronze_live_chat`
+   directly, periodically folded in by a separate timer-driven `ExecuteSQL`
+   (see [`ARCHITECTURE.md`, step
+   8](ARCHITECTURE.md#8-executesql-merge-bronze_live_chat_staging--no-incoming-connection-timer-driven)).
+   The UPSERT branch does the same table-picking trick between its two
    tables: `bronze_donation_goals` (`Update Keys = participation_id, goal_id`)
    or `bronze_emote_catalog` (`Update Keys = service, scope, channel,
-   emote_id`).
-6. **`UpdateAttribute`** — every failure path in the flow (`EvaluateJsonPath`
+   emote_id`). Both branches' Record Reader resolves an explicit Avro schema
+   by `stream` name rather than inferring one — see
+   [`ARCHITECTURE.md`, step 1b](ARCHITECTURE.md#1b-controller-service-avroschemaregistry-avroschemaregistry-ingest-streams).
+7. **`UpdateAttribute`** — every failure path in the flow (`EvaluateJsonPath`
    failing on unparseable JSON, `RouteOnAttribute`'s `unmatched`, either
    `PutDatabaseRecord` failing to write) is unified here before touching
    disk, rewriting `filename` to `${filename}-${UUID()}`. This isn't
@@ -193,14 +210,17 @@ is the ingestion path every batch from all four extractors takes:
    batch ever reached disk and every other one was silently destroyed. See
    [`ARCHITECTURE.md`](ARCHITECTURE.md) for the numbers from when this was
    found.
-7. **`PutFile` (dead-letter)** — one file per failed row, name now
+8. **`PutFile` (dead-letter)** — one file per failed row, name now
    guaranteed unique, written to `nifi/dead-letter/` for manual replay (see
    [Known limitations](#known-limitations)) — not an automated retry.
 
-Every connection here carries NiFi's default backpressure (10,000 flowfiles
-/ 1 GB): it just doesn't render as a number on an idle canvas — NiFi only
-color-codes a connection once its queue nears the threshold. A flow
-definition for all of this ships at
+Every connection here carries a 500,000 flowfile / 2 GB backpressure
+threshold (raised from NiFi's 10,000 flowfile / 1 GB default — see
+[`ARCHITECTURE.md`, "Tuning for higher
+throughput"](ARCHITECTURE.md#tuning-for-higher-throughput) for why and the
+throughput numbers behind it): it just doesn't render as a number on an idle
+canvas — NiFi only color-codes a connection once its queue nears the
+threshold. A flow definition for all of this ships at
 [`flow-templates/zevent-ingest-flow.json`](flow-templates/zevent-ingest-flow.json)
 (see [`ARCHITECTURE.md`](ARCHITECTURE.md) for how to import it).
 
@@ -400,6 +420,14 @@ generator posting synthetic `live_chat` batches to `/ingest`. This
 exercises the pipeline itself (webhook → NiFi → Postgres), not real Twitch
 chat volume.
 
+**This section is the first round of that testing and is kept as-is as a
+historical record — later rounds (the `bronze_live_chat_staging` change, the
+backpressure threshold going from 50,000 to 500,000, and the sustained-load
+disk-exhaustion finding that qualifies it) are documented in
+[`ARCHITECTURE.md`, "Tuning for higher
+throughput"](ARCHITECTURE.md#tuning-for-higher-throughput) instead of here —
+that's the current numbers, this is where they came from.**
+
 ### Baseline (NiFi's untuned defaults)
 
 Every processor in the flow defaults to NiFi's `Concurrent Tasks = 1`; the
@@ -586,8 +614,11 @@ for why.
 This repo doesn't ship an exported NiFi template (a hand-authored one can't
 be validated without a running instance to import it into). Build it per
 the [Architecture](#architecture) diagram above — `ListenHTTP` →
-`EvaluateJsonPath` → `MergeContent` → `RouteOnAttribute` → `SplitJson` →
-`PutDatabaseRecord` (+ dead-letter `PutFile` on failure). Full processor
+`EvaluateJsonPath` → `RouteOnAttribute` → `SplitJson` → `PutDatabaseRecord`
+(+ dead-letter `PutFile` on failure); the insert branch additionally passes
+through `MergeContent` between `SplitJson` and `PutDatabaseRecord` (see
+[`ARCHITECTURE.md`, step 5b](ARCHITECTURE.md#5b-mergecontent--insert-branch-only-between-splitjson-insert-and-putdatabaserecord-insert)).
+Full processor
 configuration is in [`ARCHITECTURE.md`](ARCHITECTURE.md#2-how-the-pieces-in-this-repo-map-onto-the-diagram).
 The `donation_goals` and `emote_catalog` streams share one `PutDatabaseRecord`
 branch (routed by `RouteOnAttribute` on `stream in ('donation_goals',
