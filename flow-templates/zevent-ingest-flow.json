@@ -100,7 +100,7 @@
         },
         "properties": {
           "Routing Strategy": "Route to Property name",
-          "upsert": "${stream:equals('donation_goals')}",
+          "upsert": "${stream:in('donation_goals', 'emote_catalog')}",
           "insert": "${stream:in('live_chat', 'metadata', 'zevent_snapshot')}"
         },
         "propertyDescriptors": {
@@ -236,7 +236,7 @@
           "put-db-record-quoted-identifiers": "false",
           "put-db-record-table-name": "${stream:equals('live_chat'):ifElse('bronze_live_chat_staging', ${stream:equals('metadata'):ifElse('bronze_metadata_snapshots', 'bronze_zevent_snapshots')})}",
           "put-db-record-unmatched-field-behavior": "Ignore Unmatched Fields",
-          "put-db-record-max-batch-size": "1000",
+          "put-db-record-max-batch-size": "2000",
           "put-db-record-record-reader": "10d24f39-1dab-332f-b74c-f03dade6d69d",
           "Data Record Path": null
         },
@@ -826,7 +826,7 @@
           "put-db-record-quoted-identifiers": "false",
           "put-db-record-table-name": "${stream:equals('donation_goals'):ifElse('bronze_donation_goals', 'bronze_emote_catalog')}",
           "put-db-record-unmatched-field-behavior": "Ignore Unmatched Fields",
-          "put-db-record-max-batch-size": "1000",
+          "put-db-record-max-batch-size": "2000",
           "put-db-record-record-reader": "10d24f39-1dab-332f-b74c-f03dade6d69d",
           "Data Record Path": null
         },
@@ -1322,8 +1322,8 @@
         "selectedRelationships": [
           "merged"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1356,8 +1356,8 @@
         "selectedRelationships": [
           "failure"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1390,8 +1390,8 @@
         "selectedRelationships": [
           "matched"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1424,8 +1424,8 @@
         "selectedRelationships": [
           "failure"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1458,8 +1458,8 @@
         "selectedRelationships": [
           "failure"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1492,8 +1492,8 @@
         "selectedRelationships": [
           "success"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1526,8 +1526,8 @@
         "selectedRelationships": [
           "failure"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1560,8 +1560,8 @@
         "selectedRelationships": [
           "failure"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1594,8 +1594,8 @@
         "selectedRelationships": [
           "unmatched"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1628,8 +1628,8 @@
         "selectedRelationships": [
           "success"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1662,8 +1662,8 @@
         "selectedRelationships": [
           "split"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1696,8 +1696,8 @@
         "selectedRelationships": [
           "upsert"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1730,8 +1730,8 @@
         "selectedRelationships": [
           "split"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1764,8 +1764,8 @@
         "selectedRelationships": [
           "insert"
         ],
-        "backPressureObjectThreshold": 50000,
-        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 500000,
+        "backPressureDataSizeThreshold": "2 GB",
         "flowFileExpiration": "0 sec",
         "prioritizers": [],
         "bends": [],
@@ -1795,12 +1795,12 @@
           "Timestamp Format": "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX",
           "schema-inference-cache": null,
           "Date Format": null,
-          "schema-name": "${schema.name}",
+          "schema-name": "${stream}",
           "starting-field-strategy": "ROOT_NODE",
-          "schema-registry": null,
+          "schema-registry": "b4c2b040-a8dc-413e-95f4-314b4f14a75a",
           "starting-field-name": null,
           "Time Format": null,
-          "schema-access-strategy": "infer-schema",
+          "schema-access-strategy": "schema-name",
           "schema-version": null,
           "schema-text": "${avro.schema}",
           "Allow Comments": "false"
@@ -1933,7 +1933,7 @@
           "dbcp-max-conn-lifetime": "-1",
           "db-type": "PostgreSQL",
           "Validation-query": null,
-          "Database Connection URL": "jdbc:postgresql://<POSTGRES_HOST>:<PGBOUNCER_PORT>/<POSTGRES_DB>?stringtype=unspecified&prepareThreshold=0",
+          "Database Connection URL": "jdbc:postgresql://<POSTGRES_HOST>:<PGBOUNCER_PORT>/<POSTGRES_DB>?stringtype=unspecified&prepareThreshold=0&reWriteBatchedInserts=true",
           "dbcp-time-between-eviction-runs": "-1",
           "Database User": "<DB_USER>",
           "kerberos-user-service": null,
@@ -2068,6 +2068,70 @@
         "controllerServiceApis": [
           {
             "type": "org.apache.nifi.dbcp.DBCPService",
+            "bundle": {
+              "group": "org.apache.nifi",
+              "artifact": "nifi-standard-services-api-nar",
+              "version": "1.24.0"
+            }
+          }
+        ],
+        "scheduledState": "DISABLED",
+        "bulletinLevel": "WARN",
+        "componentType": "CONTROLLER_SERVICE",
+        "groupIdentifier": "97519c4a-2b1f-3e88-ae66-9b79c4f4dc62"
+      },
+      {
+        "identifier": "b4c2b040-a8dc-413e-95f4-314b4f14a75a",
+        "instanceIdentifier": "67f749ea-561f-4ecd-a672-8773760718e7",
+        "name": "AvroSchemaRegistry (ingest streams)",
+        "type": "org.apache.nifi.schemaregistry.services.AvroSchemaRegistry",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-record-serialization-services-nar",
+          "version": "1.24.0"
+        },
+        "properties": {
+          "live_chat": "{\"type\": \"record\", \"name\": \"live_chat\", \"fields\": [{\"name\": \"batch_id\", \"type\": \"string\"}, {\"name\": \"row_number\", \"type\": \"int\"}, {\"name\": \"channel\", \"type\": \"string\"}, {\"name\": \"chatter\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"chatter_id\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"message_text\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"message_sent_at\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"captured_at\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"badges\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"user_type\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"account_created_at\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"broadcaster_type\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"emotes\", \"type\": [\"null\", \"string\"], \"default\": null}]}",
+          "metadata": "{\"type\": \"record\", \"name\": \"metadata\", \"fields\": [{\"name\": \"batch_id\", \"type\": \"string\"}, {\"name\": \"row_number\", \"type\": \"int\"}, {\"name\": \"channel\", \"type\": \"string\"}, {\"name\": \"broadcaster_id\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"is_live\", \"type\": [\"null\", \"boolean\"], \"default\": null}, {\"name\": \"title\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"category\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"viewer_count\", \"type\": [\"null\", \"int\"], \"default\": null}, {\"name\": \"duration_seconds\", \"type\": [\"null\", \"double\"], \"default\": null}, {\"name\": \"stream_started_at\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"snapshot_at\", \"type\": [\"null\", \"string\"], \"default\": null}]}",
+          "zevent_snapshot": "{\"type\": \"record\", \"name\": \"zevent_snapshot\", \"fields\": [{\"name\": \"batch_id\", \"type\": \"string\"}, {\"name\": \"row_number\", \"type\": \"int\"}, {\"name\": \"website_mode\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"total_donation_amount_eur\", \"type\": [\"null\", \"double\"], \"default\": null}, {\"name\": \"total_viewer_count\", \"type\": [\"null\", \"int\"], \"default\": null}, {\"name\": \"streamers\", \"type\": [\"null\", \"string\"], \"default\": null}]}",
+          "donation_goals": "{\"type\": \"record\", \"name\": \"donation_goals\", \"fields\": [{\"name\": \"batch_id\", \"type\": \"string\"}, {\"name\": \"row_number\", \"type\": \"int\"}, {\"name\": \"participation_id\", \"type\": \"string\"}, {\"name\": \"streamer_name\", \"type\": \"string\"}, {\"name\": \"twitch_login\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"twitch_id\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"goal_id\", \"type\": \"string\"}, {\"name\": \"goal_name\", \"type\": \"string\"}, {\"name\": \"goal_amount_eur\", \"type\": \"double\"}, {\"name\": \"goal_category\", \"type\": [\"null\", \"string\"], \"default\": null}, {\"name\": \"snapshot_at\", \"type\": \"string\"}]}",
+          "emote_catalog": "{\"type\": \"record\", \"name\": \"emote_catalog\", \"fields\": [{\"name\": \"batch_id\", \"type\": \"string\"}, {\"name\": \"row_number\", \"type\": \"int\"}, {\"name\": \"service\", \"type\": \"string\"}, {\"name\": \"scope\", \"type\": \"string\"}, {\"name\": \"channel\", \"type\": \"string\"}, {\"name\": \"emote_id\", \"type\": \"string\"}, {\"name\": \"emote_code\", \"type\": \"string\"}, {\"name\": \"fetched_at\", \"type\": \"string\"}]}"
+        },
+        "propertyDescriptors": {
+          "live_chat": {
+            "name": "live_chat",
+            "displayName": "live_chat",
+            "identifiesControllerService": false,
+            "sensitive": false
+          },
+          "metadata": {
+            "name": "metadata",
+            "displayName": "metadata",
+            "identifiesControllerService": false,
+            "sensitive": false
+          },
+          "zevent_snapshot": {
+            "name": "zevent_snapshot",
+            "displayName": "zevent_snapshot",
+            "identifiesControllerService": false,
+            "sensitive": false
+          },
+          "donation_goals": {
+            "name": "donation_goals",
+            "displayName": "donation_goals",
+            "identifiesControllerService": false,
+            "sensitive": false
+          },
+          "emote_catalog": {
+            "name": "emote_catalog",
+            "displayName": "emote_catalog",
+            "identifiesControllerService": false,
+            "sensitive": false
+          }
+        },
+        "controllerServiceApis": [
+          {
+            "type": "org.apache.nifi.schemaregistry.services.SchemaRegistry",
             "bundle": {
               "group": "org.apache.nifi",
               "artifact": "nifi-standard-services-api-nar",
