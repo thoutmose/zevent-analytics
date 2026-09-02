@@ -25,10 +25,12 @@ zstd-compressed:
   - data/metadata/   — one row per channel per METADATA_SNAPSHOT_INTERVAL_SECONDS
 Each stream rolls over to a new file every MAX_ROWS_PER_PARQUET_FILE rows
 (default 100,000), with a zero-padded part number in the filename. Buffered
-rows are also flushed to disk every FLUSH_INTERVAL_SECONDS (default 30s), and
-on a clean shutdown (Ctrl+C or SIGTERM) — which also waits for any NiFi push
-still in flight (see nifi_client.wait_for_pending_pushes) so a slow request
-isn't cancelled mid-send.
+rows are also flushed every FLUSH_INTERVAL_SECONDS (default 30s); the actual
+disk write runs in a background thread (see BatchParquetWriter.flush) so it
+can't stall chat capture for every other channel while it writes. On a clean
+shutdown (Ctrl+C or SIGTERM), waits for any in-flight parquet write and NiFi
+push (see BatchParquetWriter.wait_for_pending_writes and
+nifi_client.wait_for_pending_pushes) so neither is cancelled mid-write/send.
 """
 
 import asyncio
@@ -154,6 +156,17 @@ def _parse_emotes(raw: str | None) -> dict[str, int]:
     return counts
 
 
+def _write_parquet_file(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Blocking parquet write, run off the event loop thread (see flush() below)."""
+    pq.write_table(pa.Table.from_pylist(rows), path, compression=PARQUET_COMPRESSION)
+    LOGGER.info(
+        "[parquet] wrote %s (%d rows, %s-compressed)",
+        path.name,
+        len(rows),
+        PARQUET_COMPRESSION,
+    )
+
+
 class BatchParquetWriter:
     """Buffers rows in memory and rolls over to a new parquet file every max_rows rows.
 
@@ -170,6 +183,11 @@ class BatchParquetWriter:
         self.part: int = 1
         self.rows: list[dict[str, Any]] = []
         self.batch_started_at: datetime = datetime.now(UTC)
+        # Tracks in-flight background parquet writes (see flush()), so a graceful
+        # shutdown can await them via wait_for_pending_writes() — same pattern as
+        # nifi_client's _pending_pushes, and for the same reason (don't cancel a
+        # write that's already partway to disk).
+        self._pending_writes: set[asyncio.Future[None]] = set()
 
     def add(self, row: dict[str, Any]) -> None:
         """Buffers one row, flushing immediately if max_rows is reached."""
@@ -178,10 +196,22 @@ class BatchParquetWriter:
             self.flush()
 
     def flush(self) -> None:
-        """Writes buffered rows to a new parquet file and pushes them to NiFi.
+        """Hands buffered rows off to NiFi and a background parquet write.
 
         No-op if the buffer is empty (e.g. the periodic flush loop firing with
-        nothing new to write).
+        nothing new to write). Must be called with a running event loop (true at
+        every call site: add() runs inside the async IRC read loop, and the other
+        callers are _flush_loop and close(), both async).
+
+        The parquet write itself (pq.write_table, CPU/disk-bound) runs in a thread
+        via run_in_executor rather than inline: this is called straight from the
+        chat-message hot path (on_chat_message -> add() -> flush()), and at
+        Zevent-scale chat volume a multi-thousand-row write done inline would stall
+        the single asyncio event loop — and therefore every other channel's chat,
+        the Helix polls, and NiFi pushes — for the duration of the write. A write
+        failure is now logged (see _write_parquet_file's caller below) rather than
+        propagating to _connect_once's reconnect handler like it used to; a bad
+        disk write doesn't need to restart an unrelated IRC shard to be visible.
         """
         if not self.rows:
             return
@@ -191,19 +221,45 @@ class BatchParquetWriter:
             self.directory
             / f"zevent_{timestamp}Z_{self.suffix}_part{self.part:05d}.parquet"
         )
-        pq.write_table(
-            pa.Table.from_pylist(rows), path, compression=PARQUET_COMPRESSION
-        )
-        LOGGER.info(
-            "[parquet] wrote %s (%d rows, %s-compressed)",
-            path.name,
-            len(rows),
-            PARQUET_COMPRESSION,
-        )
-        nifi_client.push_batch_background("main.py", self.suffix, rows)
         self.rows = []
         self.part += 1
         self.batch_started_at = datetime.now(UTC)
+
+        nifi_client.push_batch_background("main.py", self.suffix, rows)
+
+        future = asyncio.get_running_loop().run_in_executor(
+            None, _write_parquet_file, path, rows
+        )
+        self._pending_writes.add(future)
+
+        def _on_done(f: "asyncio.Future[None]") -> None:
+            self._pending_writes.discard(f)
+            exc = f.exception() if not f.cancelled() else None
+            if exc is not None:
+                LOGGER.error("[parquet] write %s failed", path.name, exc_info=exc)
+
+        future.add_done_callback(_on_done)
+
+    async def wait_for_pending_writes(self, timeout: float = 30.0) -> None:
+        """Awaits every background parquet write still in flight.
+
+        Call this during shutdown, before the event loop closes — see the
+        _pending_writes docstring above for why waiting beats cancelling.
+        """
+        pending = list(self._pending_writes)
+        if not pending:
+            return
+        LOGGER.info(
+            "[parquet] waiting for %d pending write(s) before shutdown", len(pending)
+        )
+        _, still_pending = await asyncio.wait(pending, timeout=timeout)
+        if still_pending:
+            LOGGER.warning(
+                "[parquet] %d write(s) still in flight after %.0fs, letting "
+                "shutdown proceed anyway",
+                len(still_pending),
+                timeout,
+            )
 
 
 @dataclass
@@ -262,10 +318,12 @@ class ChatConnection:
                 backoff = 5
             except Exception:
                 # Broad on purpose: anything from here (a network drop, but also
-                # e.g. a parquet write failure inside on_chat_message -> add() ->
-                # flush()) should reconnect and keep going rather than silently
-                # end chat capture for this shard's ~50 channels for the rest of
-                # a 55-hour event.
+                # e.g. bad IRC tags on_chat_message can't parse) should reconnect
+                # and keep going rather than silently end chat capture for this
+                # shard's ~50 channels for the rest of a 55-hour event. A parquet
+                # write failure no longer lands here — it runs in a background
+                # thread now (see BatchParquetWriter.flush) and is logged there
+                # instead, since it has nothing to do with this IRC connection.
                 sleep_seconds = min(backoff + random.uniform(0, backoff), 60)
                 LOGGER.exception(
                     "IRC connection dropped (%d channels), reconnecting in %.1fs",
@@ -630,10 +688,12 @@ class ZeventBot(commands.Bot):
 
     @override
     async def close(self, **options: object) -> None:
-        """Flushes buffered rows, waits for any in-flight NiFi push, then
-        closes the bot."""
+        """Flushes buffered rows, waits for any in-flight parquet write and NiFi
+        push, then closes the bot."""
         self.chat_writer.flush()
         self.metadata_writer.flush()
+        await self.chat_writer.wait_for_pending_writes()
+        await self.metadata_writer.wait_for_pending_writes()
         await nifi_client.wait_for_pending_pushes()
         await super().close(**options)
 
