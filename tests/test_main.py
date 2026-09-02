@@ -81,7 +81,7 @@ def test_parse_emotes_single_occurrence():
     assert main._parse_emotes("354:0-3") == {"354": 1}
 
 
-def test_batch_parquet_writer_flush_is_noop_on_empty_buffer(tmp_path: Path):
+async def test_batch_parquet_writer_flush_is_noop_on_empty_buffer(tmp_path: Path):
     writer = main.BatchParquetWriter(tmp_path, "test", max_rows=10)
     writer.flush()
 
@@ -89,13 +89,14 @@ def test_batch_parquet_writer_flush_is_noop_on_empty_buffer(tmp_path: Path):
     assert writer.part == 1
 
 
-def test_batch_parquet_writer_rolls_over_at_max_rows(
+async def test_batch_parquet_writer_rolls_over_at_max_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.setattr(nifi_client, "NIFI_WEBHOOK_URL", None)
     writer = main.BatchParquetWriter(tmp_path, "test", max_rows=2)
     writer.add({"n": 1})
     writer.add({"n": 2})
+    await writer.wait_for_pending_writes()
 
     assert writer.rows == []
     assert writer.part == 2
