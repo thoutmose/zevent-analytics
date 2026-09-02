@@ -161,11 +161,25 @@ jobs:
           ssh -p "$SRV_PROD_SSH_PORT" "$SRV_PROD_USER@$SRV_PROD_HOST" "
             set -euo pipefail
             cd '$DEPLOY_PATH'
+            # PgBouncer/Postgres can be momentarily unreachable (e.g. mid
+            # restart) independent of anything this deploy changed. Retry a
+            # few times with backoff before failing the whole deploy over a
+            # transient blip; a real outage still fails after the last try.
             for f in sql/*.sql; do
               echo \"Applying \$f\"
-              docker run --rm --env-file .env.postgres \
-                -v \"\$(pwd)/\$f:/migration.sql:ro\" \
-                postgres:16 psql -v ON_ERROR_STOP=1 -f /migration.sql
+              for attempt in 1 2 3 4 5; do
+                if docker run --rm --env-file .env.postgres \
+                  -v \"\$(pwd)/\$f:/migration.sql:ro\" \
+                  postgres:16 psql -v ON_ERROR_STOP=1 -f /migration.sql; then
+                  break
+                fi
+                if [ \"\$attempt\" = 5 ]; then
+                  echo \"giving up on \$f after 5 attempts\" >&2
+                  exit 1
+                fi
+                echo \"retrying \$f in \$((attempt * 5))s (attempt \$attempt/5)...\"
+                sleep \$((attempt * 5))
+              done
             done
           "
 
