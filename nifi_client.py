@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import uuid
 from datetime import UTC, date, datetime
 from typing import Any
@@ -28,6 +29,21 @@ LOGGER: logging.Logger = logging.getLogger("nifi_client")
 NIFI_WEBHOOK_URL: str | None = os.environ.get("NIFI_WEBHOOK_URL")
 NIFI_REQUEST_TIMEOUT_SECONDS: int = int(
     os.environ.get("NIFI_REQUEST_TIMEOUT_SECONDS", "10")
+)
+# How many times to retry a batch that NiFi rejected (503, ListenHTTP's connection
+# backpressure) or that failed ambiguously (timeout/connection error) before giving
+# up. Both are safe to retry now that batch_id is generated once and reused across
+# attempts (see push_batch): a 503 means ListenHTTP never accepted the flowfile, and
+# an ambiguous failure that *did* land anyway is caught by ON CONFLICT (batch_id,
+# row_number) DO NOTHING downstream (DO UPDATE for the upsert streams, keyed on their
+# own business key instead — see ARCHITECTURE.md step 6b) — a retry becomes a no-op
+# rather than a duplicate insert either way. Found necessary live on srv-dev,
+# 2026-09-02: a stress test showed ListenHTTP starts returning 503 well before
+# Postgres's own write ceiling is anywhere near reached, and this module previously
+# just dropped the batch on the first 503 with no retry at all.
+NIFI_MAX_RETRIES: int = int(os.environ.get("NIFI_MAX_RETRIES", "4"))
+NIFI_RETRY_BACKOFF_SECONDS: float = float(
+    os.environ.get("NIFI_RETRY_BACKOFF_SECONDS", "1.0")
 )
 
 # Tracks in-flight push_batch() background tasks (see push_batch_background), so a
@@ -59,7 +75,9 @@ def _json_default(value: object) -> str:
 
 
 async def push_batch(source: str, stream: str, rows: list[dict[str, Any]]) -> None:
-    """POSTs one batch to NIFI_WEBHOOK_URL (a NiFi ListenHTTP processor).
+    """POSTs one batch to NIFI_WEBHOOK_URL (a NiFi ListenHTTP processor), retrying
+    on backpressure (503) or an ambiguous connection failure up to NIFI_MAX_RETRIES
+    times with exponential backoff.
 
     No-op if NIFI_WEBHOOK_URL is unset or rows is empty. Prefer
     push_batch_background() over calling this directly with asyncio.create_task,
@@ -68,6 +86,9 @@ async def push_batch(source: str, stream: str, rows: list[dict[str, Any]]) -> No
     if not NIFI_WEBHOOK_URL or not rows:
         return
 
+    # Generated once and reused across every retry attempt below — this is what
+    # makes retrying safe (see NIFI_MAX_RETRIES' docstring): downstream ON CONFLICT
+    # only dedupes a replay if it's still the same batch_id.
     batch_id = str(uuid.uuid4())
     payload = {
         "source": source,
@@ -92,35 +113,60 @@ async def push_batch(source: str, stream: str, rows: list[dict[str, Any]]) -> No
         len(body),
     )
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                NIFI_WEBHOOK_URL,
-                data=body,
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=NIFI_REQUEST_TIMEOUT_SECONDS),
-            ) as resp:
-                resp.raise_for_status()
-        LOGGER.info(
-            "[nifi] pushed %s/%s batch_id=%s (%d rows)",
-            source,
-            stream,
-            batch_id,
-            len(rows),
-        )
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        # A timeout here is ambiguous, not necessarily a failure: the request may
-        # have already reached NiFi even though we didn't see the response in time.
-        # Don't auto-retry on this exception — a blind retry can double-insert.
-        LOGGER.exception(
-            "[nifi] push %s/%s batch_id=%s (%d rows) to %s did not confirm — "
-            "it may or may not have landed",
-            source,
-            stream,
-            batch_id,
-            len(rows),
-            NIFI_WEBHOOK_URL,
-        )
+    async with aiohttp.ClientSession() as session:
+        for attempt in range(1, NIFI_MAX_RETRIES + 1):
+            last_status: int | None = None
+            try:
+                async with session.post(
+                    NIFI_WEBHOOK_URL,
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=NIFI_REQUEST_TIMEOUT_SECONDS),
+                ) as resp:
+                    last_status = resp.status
+                    resp.raise_for_status()
+                LOGGER.info(
+                    "[nifi] pushed %s/%s batch_id=%s (%d rows)%s",
+                    source,
+                    stream,
+                    batch_id,
+                    len(rows),
+                    f" on retry {attempt}/{NIFI_MAX_RETRIES}" if attempt > 1 else "",
+                )
+                return
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                # 503 (ListenHTTP's connection backpressure) is the expected retry
+                # case; anything else (a connection reset, a timeout) is ambiguous —
+                # it may have already landed — but is just as safe to retry here
+                # given the stable batch_id above. A genuine 4xx client error (bad
+                # payload) would keep failing identically on every attempt, so this
+                # doesn't try to distinguish it from a transient one; it just retries
+                # everything and gives up after NIFI_MAX_RETRIES either way.
+                if attempt == NIFI_MAX_RETRIES:
+                    LOGGER.exception(
+                        "[nifi] push %s/%s batch_id=%s (%d rows) to %s did not "
+                        "confirm after %d attempt(s) — it may or may not have landed",
+                        source,
+                        stream,
+                        batch_id,
+                        len(rows),
+                        NIFI_WEBHOOK_URL,
+                        attempt,
+                    )
+                    return
+                backoff = NIFI_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                LOGGER.warning(
+                    "[nifi] push %s/%s batch_id=%s attempt %d/%d failed "
+                    "(status=%s), retrying in %.1fs",
+                    source,
+                    stream,
+                    batch_id,
+                    attempt,
+                    NIFI_MAX_RETRIES,
+                    last_status,
+                    backoff,
+                )
+                await asyncio.sleep(backoff + random.uniform(0, backoff * 0.1))
 
 
 def push_batch_background(source: str, stream: str, rows: list[dict[str, Any]]) -> None:

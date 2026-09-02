@@ -36,7 +36,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS bronze_live_chat_staging (
     emotes             JSONB
 );
 
-CREATE INDEX IF NOT EXISTS bronze_live_chat_staging_batch_id_idx ON bronze_live_chat_staging (batch_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS bronze_live_chat_staging_batch_id_idx ON bronze_live_chat_staging (batch_id);
 
 -- Atomically drains everything currently in staging and folds it into
 -- bronze_live_chat in one statement: the DELETE...RETURNING snapshot only sees rows
@@ -73,4 +73,4 @@ $$ LANGUAGE sql;
 -- bytes per page instead of per row, which matters at Zevent's insert volume.
 -- Replaces the btree version from 001_bronze_schema.sql.
 DROP INDEX CONCURRENTLY IF EXISTS bronze_live_chat_captured_at_idx;
-CREATE INDEX CONCURRENTLY IF NOT EXISTS bronze_live_chat_captured_at_brin_idx ON bronze_live_chat USING BRIN (captured_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS bronze_live_chat_captured_at_brin_idx ON bronze_live_chat USING brin (captured_at);

@@ -26,10 +26,12 @@ services:
       SINGLE_USER_CREDENTIALS_PASSWORD: ${NIFI_ADMIN_PASSWORD:?set NIFI_ADMIN_PASSWORD in .env (min 12 chars)}
       # Stock image default (512m/512m, set in bootstrap.conf) starts GC-thrashing well
       # before Zevent-scale load (6000+ TPS, thousands of in-flight flowfiles post-
-      # SplitJson). Sized for srv-prod's headroom, not a hard requirement — lower if the
-      # host doesn't have it. See ARCHITECTURE.md, "Tuning for higher throughput".
-      NIFI_JVM_HEAP_INIT: ${NIFI_JVM_HEAP_INIT:-2g}
-      NIFI_JVM_HEAP_MAX: ${NIFI_JVM_HEAP_MAX:-4g}
+      # SplitJson). Sized for a 16 GB srv-prod host: 8g max leaves the rest for the OS
+      # page cache the content/provenance repositories lean on, not a hard requirement —
+      # lower if the host doesn't have it. See ARCHITECTURE.md, "Tuning for higher
+      # throughput".
+      NIFI_JVM_HEAP_INIT: ${NIFI_JVM_HEAP_INIT:-4g}
+      NIFI_JVM_HEAP_MAX: ${NIFI_JVM_HEAP_MAX:-8g}
     # The stock entrypoint (scripts/start.sh) doesn't expose an env var for provenance
     # repository retention, so tune-provenance-retention.sh patches nifi.properties
     # before handing off to it. Without this, provenance defaults to 30 days / 10 GB —
