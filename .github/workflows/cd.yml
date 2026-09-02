@@ -101,6 +101,19 @@ jobs:
             drivers/ \
             "$SRV_PROD_USER@$SRV_PROD_HOST:$DEPLOY_PATH/drivers/"
 
+          # nifi/ itself (e.g. tune-provenance-retention.sh, the custom
+          # entrypoint docker-compose.yml bind-mounts) was never synced here
+          # before, even though docker-compose.yml already depended on it —
+          # Docker silently turns a missing bind-mount source into an empty
+          # directory instead of erroring, so the container just crash-looped
+          # on every deploy instead of failing loudly. dead-letter/ is still
+          # excluded: it's a live volume mount with production data, not a
+          # deploy artifact.
+          rsync -rz --delete --exclude=dead-letter/ --no-owner --no-group --no-perms --no-times \
+            -e "ssh -p $SRV_PROD_SSH_PORT" \
+            nifi/ \
+            "$SRV_PROD_USER@$SRV_PROD_HOST:$DEPLOY_PATH/nifi/"
+
       - name: Sync Python source files
         # main.py/zevent_api.py/zevent_donation_goals.py run as systemd
         # services (zevent-*-prod), started independently of this pipeline
