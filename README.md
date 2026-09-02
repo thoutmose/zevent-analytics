@@ -215,7 +215,7 @@ is the ingestion path every batch from all four extractors takes:
    [Known limitations](#known-limitations)) — not an automated retry.
 
 Every connection here carries a 500,000 flowfile / 2 GB backpressure
-threshold (raised from NiFi's 10,000 flowfile / 1 GB default — see
+threshold (raised from NiFi's 20,000 flowfile / 1 GB default — see
 [`ARCHITECTURE.md`, "Tuning for higher
 throughput"](ARCHITECTURE.md#tuning-for-higher-throughput) for why and the
 throughput numbers behind it): it just doesn't render as a number on an idle
@@ -238,8 +238,8 @@ flowchart LR
     subgraph PVE["Proxmox host"]
         NPM["srv-npm<br/>reverse proxy<br/>LXC · 2 vCPU / 2 GB / 8 GB"]
         DEV["srv-dev<br/>extractors + dev NiFi<br/>VM · 4 vCPU / 8 GB / 40 GB"]
-        PROD["srv-prod<br/>extractors + prod NiFi<br/>VM · 6 vCPU / 12 GB / 40 GB"]
-        DB["srv-db<br/>PostgreSQL + PgBouncer<br/>VM · 4 vCPU / 8 GB / 100 GB"]
+        PROD["srv-prod<br/>extractors + prod NiFi<br/>VM · 8 vCPU / 16 GB / 120 GB"]
+        DB["srv-db<br/>PostgreSQL + PgBouncer<br/>VM · 8 vCPU / 16 GB / 270 GB"]
         SVC["srv-services<br/>cold-storage archive + pgAdmin<br/>VM · 6 vCPU / 12 GB / 450 GB"]
         MON["srv-monitoring<br/>standalone, unused by this repo<br/>LXC · 2 vCPU / 2 GB / 20 GB"]
     end
@@ -258,12 +258,12 @@ flowchart LR
 | Host | Role | Type | vCPU | RAM | Disk |
 |---|---|---|---|---|---|
 | `srv-dev` | Dev machine — extractors + this repo's checkout + dev NiFi | VM | 4 | 8 GB | 40 GB |
-| `srv-prod` | Prod machine — extractors + this repo's checkout + prod NiFi  | VM | 6 | 12 GB | 40 GB |
-| `srv-db` | PostgreSQL + PgBouncer — not managed by this repo | VM | 4 | 8 GB | 100 GB |
+| `srv-prod` | Prod machine — extractors + this repo's checkout + prod NiFi  | VM | 8 | 16 GB | 120 GB |
+| `srv-db` | PostgreSQL + PgBouncer — not managed by this repo | VM | 8 | 16GB | 270 GB |
 | `srv-services` | Cold-storage target for [`archive_parquet.py`](archive_parquet.py)/[`archive_logs.py`](archive_logs.py), plus [pgAdmin](https://www.pgadmin.org/) (`dpage/pgadmin4`, port 5050) for ad-hoc Postgres administration | VM | 6 | 12 GB | 450 GB |
 | `srv-npm` | Reverse proxy in front of `*.thoutmose.me` | LXC | 2 | 2 GB | 8 GB |
 | `srv-monitoring` | Monitoring stack — standalone, not integrated with this repo | LXC | 2 | 2 GB | 20 GB |
-| **Total** | | | **24** | **44 GB** | **658 GB** |
+| **Total** | | | **30** | **56 GB** | **908 GB** |
 
 24 vCPU and 44 GB of RAM, split across 4 VMs and 2 LXC containers on one
 physical box, is the entire footprint for ingesting ~300 channels' live
@@ -432,7 +432,7 @@ that's the current numbers, this is where they came from.**
 
 Every processor in the flow defaults to NiFi's `Concurrent Tasks = 1`; the
 `DBCPConnectionPool` defaults to `Max Total Connections = 8`; every
-inter-processor connection defaults to a 10,000-flowfile backpressure
+inter-processor connection defaults to a 20,000-flowfile backpressure
 threshold.
 
 - **1 concurrent producer:** ~220 req/s (~4,400 rows/s) accepted, 0%
@@ -462,7 +462,7 @@ below):
 | `EvaluateJsonPath` / `RouteOnAttribute` / `SplitJson (insert)` Concurrent Tasks | 1 | 4 |
 | `SplitJson (upsert)` / `PutDatabaseRecord (UPSERT)` / dead-letter processors Concurrent Tasks | 1 | 2 |
 | `DBCPConnectionPool` Max Total Connections | 8 | 24 |
-| Connection backpressure object threshold | 10,000 | 50,000 |
+| Connection backpressure object threshold | 20,000 | 50,000 |
 | `nifi.content.repository.archive.max.retention.period` | 7 days | 2 minutes |
 | `nifi.content.repository.archive.max.usage.percentage` | 50% | 90% |
 
@@ -490,7 +490,7 @@ Results:
   `srv-dev` (a shared 38GB disk, ~69% used from non-NiFi data) well before
   NiFi's own footprint was meaningful (its archive was 1.64MB at the time).
 - **Deep queues degrade throughput non-linearly.** Once a connection's
-  queue passes NiFi's in-memory swap threshold (10,000 flowfiles), it
+  queue passes NiFi's in-memory swap threshold (20,000 flowfiles), it
   starts swapping to disk; a backlog that oscillates around that threshold
   causes repeated swap-out/swap-in churn that dropped measured drain
   throughput from ~3,000 rows/s to ~60 rows/s. Keeping bursts under ~10K
@@ -779,7 +779,7 @@ authoritative, commented list). Highlights:
 | `CHATTER_LOOKUP_INTERVAL_SECONDS` | `30` | How often unresolved chatters get a batched Helix Get Users lookup (`account_created_at`/`broadcaster_type`) |
 | `ZEVENT_API_POLL_INTERVAL_SECONDS` | `20` | `zevent.fr/api/` poll interval |
 | `FLUSH_INTERVAL_SECONDS` | `30` | How often buffered rows are flushed to Parquet/NiFi |
-| `MAX_ROWS_PER_PARQUET_FILE` | `100000` | Row cap before a Parquet file rolls over |
+| `MAX_ROWS_PER_PARQUET_FILE` | `200000` | Row cap before a Parquet file rolls over |
 | `PARQUET_COMPRESSION` | `zstd` | Codec passed to `pyarrow.parquet.write_table` |
 | `PARQUET_OUTPUT_DIR` | `data` | Local Parquet landing zone |
 | `ARCHIVE_REMOTE_HOST` | `srv-services` | SSH destination for `archive_parquet.py`/`archive_logs.py` (recommend an `~/.ssh/config` alias) |
