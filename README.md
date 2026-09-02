@@ -11,9 +11,12 @@
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-4169E1?logo=postgresql&logoColor=white)
 ![PgBouncer](https://img.shields.io/badge/PgBouncer-connection%20pooling-4169E1)
 ![Docker Compose](https://img.shields.io/badge/Docker%20Compose-NiFi%20stack-2496ED?logo=docker&logoColor=white)
+![dbt](https://img.shields.io/badge/dbt-transformation-FF694B?logo=dbt&logoColor=white)
 ![Ruff](https://img.shields.io/badge/lint%20%2F%20format-Ruff-D7FF64?logo=ruff&logoColor=black)
 ![ty](https://img.shields.io/badge/type%20check-ty-FCA121)
 [![CI](https://github.com/thoutmose/zevent-analytics/actions/workflows/ci.yml/badge.svg)](https://github.com/thoutmose/zevent-analytics/actions/workflows/ci.yml)
+
+**[English](README.md) · [Français](README.fr.md)**
 
 Extracts live-stream data for every Twitch channel participating in
 [Zevent](https://zevent.fr/) — chat, viewer counts, stream metadata, and the

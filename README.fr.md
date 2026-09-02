@@ -16,7 +16,7 @@
 ![ty](https://img.shields.io/badge/type%20check-ty-FCA121)
 [![CI](https://github.com/thoutmose/zevent-analytics/actions/workflows/ci.yml/badge.svg)](https://github.com/thoutmose/zevent-analytics/actions/workflows/ci.yml)
 
-*[English version](README.md)*
+**[English](README.md) · [Français](README.fr.md)**
 
 Extrait les données en direct de chaque chaîne Twitch participant au
 [Zevent](https://zevent.fr/) — chat, nombre de viewers, métadonnées de
@@ -141,9 +141,9 @@ flowchart LR
     ZAPI -- NIFI_WEBHOOK_URL --> LISTEN
     DGOAL -- NIFI_WEBHOOK_URL --> LISTEN
     ECAT -- NIFI_WEBHOOK_URL --> LISTEN
-    LISTEN --> EJP --> MERGE --> ROUTE --> SPLIT
+    LISTEN --> EJP --> ROUTE --> SPLIT
     SPLIT -- "stream in (donation_goals, emote_catalog)" --> PUTDBUP
-    SPLIT -- tout autre stream --> PUTDB
+    SPLIT -- tout autre stream --> MERGE --> PUTDB
     PUTDB -- succès --> PG
     PUTDB -- échec --> DEADLETTER
     PUTDBUP -- succès --> PG
@@ -185,15 +185,32 @@ prend chaque lot des quatre extracteurs :
    `batch_id` + `row_number` (défini côté Python, voir `nifi_client.py`) —
    c'est ce qui rend un lot renvoyé idempotent au niveau de la base de
    données, pas quelque chose que NiFi ferait lui-même.
-5. **`PutDatabaseRecord`** (un par branche) — le puits. La branche INSERT
-   choisit sa table cible (`bronze_live_chat` / `bronze_metadata_snapshots`
-   / `bronze_zevent_snapshots`) via un ternaire NiFi Expression Language
-   sur l'attribut `stream`, si bien qu'un seul processeur couvre trois
-   tables au lieu de trois quasi identiques. La branche UPSERT fait la même
-   chose entre ses deux tables : `bronze_donation_goals`
+5. **`MergeContent`** (branche INSERT uniquement) — réassemble les lignes de
+   même `stream` que l'étape 4 vient de séparer, en un tableau JSON groupé,
+   pour que `PutDatabaseRecord` émette un seul insert JDBC groupé par bin au
+   lieu d'une ligne à la fois. La branche UPSERT passe directement de
+   `SplitJson` à `PutDatabaseRecord` — le volume de poll de
+   donation_goals/emote_catalog n'en a pas besoin. Voir
+   [`ARCHITECTURE.md`, étape
+   5b](ARCHITECTURE.md#5b-mergecontent--insert-branch-only-between-splitjson-insert-and-putdatabaserecord-insert).
+6. **`PutDatabaseRecord`** (un par branche) — le puits. La branche INSERT
+   choisit sa table cible (`bronze_live_chat_staging` pour `live_chat` /
+   `bronze_metadata_snapshots` / `bronze_zevent_snapshots`) via un ternaire
+   NiFi Expression Language sur l'attribut `stream`, si bien qu'un seul
+   processeur couvre trois tables au lieu de trois quasi identiques —
+   `live_chat` atterrit dans une table de staging `UNLOGGED` au lieu de
+   `bronze_live_chat` directement, repliée périodiquement par un
+   `ExecuteSQL` séparé, piloté par minuteur (voir
+   [`ARCHITECTURE.md`, étape
+   8](ARCHITECTURE.md#8-executesql-merge-bronze_live_chat_staging--no-incoming-connection-timer-driven)).
+   La branche UPSERT fait la même astuce de choix de table entre ses deux
+   tables : `bronze_donation_goals`
    (`Update Keys = participation_id, goal_id`) ou `bronze_emote_catalog`
-   (`Update Keys = service, scope, channel, emote_id`).
-6. **`UpdateAttribute`** — chaque chemin d'échec du flow (`EvaluateJsonPath`
+   (`Update Keys = service, scope, channel, emote_id`). Le Record Reader des
+   deux branches résout un schéma Avro explicite par nom de `stream` plutôt
+   que de l'inférer — voir
+   [`ARCHITECTURE.md`, étape 1b](ARCHITECTURE.md#1b-controller-service-avroschemaregistry-avroschemaregistry-ingest-streams).
+7. **`UpdateAttribute`** — chaque chemin d'échec du flow (`EvaluateJsonPath`
    qui échoue sur du JSON invalide, `unmatched` de `RouteOnAttribute`, l'un
    ou l'autre `PutDatabaseRecord` qui échoue à écrire) est unifié ici avant
    de toucher le disque, en réécrivant `filename` en
@@ -204,16 +221,19 @@ prend chaque lot des quatre extracteurs :
    échec par lot atteignait le disque, et toutes les autres disparaissaient
    silencieusement. Voir [`ARCHITECTURE.md`](ARCHITECTURE.md) pour les
    chiffres du moment où ça a été découvert.
-7. **`PutFile` (dead-letter)** — un fichier par ligne en échec, nom
+8. **`PutFile` (dead-letter)** — un fichier par ligne en échec, nom
    désormais garanti unique, écrit dans `nifi/dead-letter/` pour rejeu
    manuel (voir [Limitations connues](#limitations-connues)) — pas une
    nouvelle tentative automatique.
 
-Chaque connexion ici porte la backpressure par défaut de NiFi (10 000
-flowfiles / 1 Go) : ça ne s'affiche simplement pas comme un chiffre sur un
-canevas au repos — NiFi ne colore une connexion qu'une fois sa file
-d'attente proche du seuil. Une définition de flow pour tout ceci est
-fournie dans
+Chaque connexion ici porte un seuil de backpressure de 500 000 flowfiles /
+2 Go (relevé depuis le défaut NiFi de 10 000 flowfiles / 1 Go — voir
+[`ARCHITECTURE.md`, "Tuning for higher
+throughput"](ARCHITECTURE.md#tuning-for-higher-throughput) pour le pourquoi
+et les chiffres de débit derrière ce choix) : ça ne s'affiche simplement pas
+comme un chiffre sur un canevas au repos — NiFi ne colore une connexion
+qu'une fois sa file d'attente proche du seuil. Une définition de flow pour
+tout ceci est fournie dans
 [`flow-templates/zevent-ingest-flow.json`](flow-templates/zevent-ingest-flow.json)
 (voir [`ARCHITECTURE.md`](ARCHITECTURE.md) pour comment l'importer).
 
@@ -432,6 +452,15 @@ montante qui poste des lots `live_chat` synthétiques vers `/ingest`. Ceci
 exerce le pipeline lui-même (webhook → NiFi → Postgres), pas un vrai volume
 de chat Twitch.
 
+**Cette section est le premier round de ces tests et reste telle quelle
+comme trace historique — les rounds suivants (le changement
+`bronze_live_chat_staging`, le seuil de backpressure passant de 50 000 à
+500 000, et la découverte sur l'épuisement disque en charge soutenue qui le
+nuance) sont documentés dans
+[`ARCHITECTURE.md`, "Tuning for higher
+throughput"](ARCHITECTURE.md#tuning-for-higher-throughput) plutôt qu'ici —
+ce sont les chiffres actuels, ceci est leur origine.**
+
 ### Ligne de base (réglages NiFi par défaut, non ajustés)
 
 Chaque processeur du flow a par défaut `Concurrent Tasks = 1` chez NiFi ; le
@@ -626,9 +655,12 @@ pour le pourquoi.
 Ce dépôt ne fournit pas de template NiFi exporté (un template écrit à la
 main ne peut pas être validé sans une instance en marche pour l'importer).
 Le construire selon le diagramme [Architecture](#architecture) ci-dessus —
-`ListenHTTP` → `EvaluateJsonPath` → `MergeContent` → `RouteOnAttribute` →
-`SplitJson` → `PutDatabaseRecord` (+ `PutFile` dead-letter sur échec). La
-configuration complète des processeurs est dans
+`ListenHTTP` → `EvaluateJsonPath` → `RouteOnAttribute` → `SplitJson` →
+`PutDatabaseRecord` (+ `PutFile` dead-letter sur échec) ; la branche INSERT
+passe en plus par `MergeContent` entre `SplitJson` et `PutDatabaseRecord`
+(voir [`ARCHITECTURE.md`, étape
+5b](ARCHITECTURE.md#5b-mergecontent--insert-branch-only-between-splitjson-insert-and-putdatabaserecord-insert)).
+La configuration complète des processeurs est dans
 [`ARCHITECTURE.md`](ARCHITECTURE.md#2-how-the-pieces-in-this-repo-map-onto-the-diagram).
 Les flux `donation_goals` et `emote_catalog` partagent une seule branche
 `PutDatabaseRecord` (routée par `RouteOnAttribute` sur `stream in
