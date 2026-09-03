@@ -126,6 +126,18 @@ payload already sends them as ISO-8601/UUID text, and the JDBC driver
 inferring for these fields; switching to an explicit schema changes where
 the type comes from, not what type gets sent.
 
+**Creating this controller service via the NiFi REST API (`POST
+/nifi-api/process-groups/{id}/controller-services`) needs the right `bundle`
+— don't copy it from a flow-template export.** `AvroSchemaRegistry` lives in
+`nifi-registry-nar` on a stock `apache/nifi:1.24.0` image; the bundle recorded
+in `flow-templates/zevent-ingest-flow.json` from an earlier export was
+`nifi-record-serialization-services-nar`, which 409s with `Found bundle ...
+but does not support org.apache.nifi.schemaregistry.services.AvroSchemaRegistry`
+on a fresh instance. Confirmed the correct bundle for any component this way
+happens instead of by matching the last export: `GET
+/nifi-api/flow/controller-service-types`, filter by `type`. Found live on
+srv-prod, 2026-09-03, applying this exact schema registry for the first time.
+
 ### 1c. `JsonTreeReader`'s Schema Access Strategy
 
 Set on the reader created in step 6a/6b (shared by both `PutDatabaseRecord`
@@ -256,6 +268,21 @@ emote_catalog poll volume doesn't need the batching, and the `upsert`
 relationship never routes through it. Wire its `merged` relationship to
 `PutDatabaseRecord (INSERT)` and its `failure` relationship to the
 dead-letter path (step 7a), same as every other processor here.
+
+**One malformed row now fails the whole bin it landed in, not just itself.**
+Before this processor existed, `PutDatabaseRecord (INSERT)` issued one plain
+`INSERT` per row, so a bad row only failed itself. With bin-packing in front
+of it, up to `Maximum Number of Entries` (1000) rows share a single JDBC
+batch statement — if even one of them violates a constraint (a `NOT NULL`
+column with no value, say), the whole batch fails and every row in that bin
+routes to `failure` together, including the ones that would otherwise have
+inserted cleanly. Found live on srv-prod, 2026-09-03, replaying dead-lettered
+rows from an unrelated incident: 2,264 corrupted rows (all fields empty
+except `batch_id`/`row_number`) collaterally dead-lettered 161 otherwise-good
+rows they happened to share a bin with. Not something to design around here —
+`PutDatabaseRecord`'s `Statement Type=INSERT` has no partial-batch-success
+mode — but worth knowing before assuming a `failure` flowfile from this path
+means every row in it was actually bad.
 
 ### 6a. `PutDatabaseRecord` — INSERT branch (`insert` relationship, via step 5b's `MergeContent`)
 
@@ -516,7 +543,18 @@ Applying the concurrency/pool/backpressure values:
    Tasks; the `DBCPConnectionPool` controller service's Properties tab for
    the pool settings; right-click each connection → Configure → Settings tab
    for backpressure), then stop/start the processor (or the controller
-   service, for the pool change) so it actually takes effect.
+   service, for the pool change) so it actually takes effect. **Or script it
+   against the REST API** — this is what was actually used to bring
+   srv-prod's live flow in line on 2026-09-03 (see "srv-prod drift found and
+   fixed" below): fetch each component, `PUT` back its revision plus the
+   changed field only, stop/start around any change to a running
+   processor or enabled controller service. The one hazard doing it this way
+   (vs. the UI): a `GET` masks every sensitive property as `********`, so
+   never spread a fetched `properties` dict into a `PUT` body — build the
+   payload from just the fields you're actually changing, or you'll silently
+   overwrite something like `DBCPConnectionPool`'s `Password` with the
+   placeholder itself (see "Stability findings and stress-test validation"
+   below for both times this actually happened).
 
 Also stress-tested, and now persisted via `nifi/tune-provenance-retention.sh`
 (the same entrypoint script that patches provenance retention — see
@@ -531,7 +569,8 @@ env vars onto `nifi.properties` (`NIFI_WEB_*`, `NIFI_CLUSTER_*`,
 aren't in that set, which is why the entrypoint script patches
 `nifi.properties` directly, the same way it already did for provenance
 retention. These two properties directly gate how aggressively NiFi
-throttles writes under disk pressure (see "Stability findings" in README),
+throttles writes under disk pressure (see "Stability findings and
+stress-test validation" below),
 and getting the override wrong is exactly the kind of change that caused the
 ~8.5-minute production DB-write outage noted there — reapply and confirm
 with a rolling restart on one instance before trusting this on srv-prod.
@@ -569,6 +608,145 @@ actually restarted on srv-prod to pick it up.
 
 Re-run `stress_test.py` against the target instance after applying the NiFi
 UI changes to confirm the new ceiling before assuming 6,000 TPS is met.
+
+### srv-prod drift found and fixed, 2026-09-03
+
+srv-dev's tuning above was applied and validated on 2026-08-30/09-02; it was
+never applied to srv-prod's live flow until 2026-09-03, well after the
+`RouteOnAttribute` fix date below — meaning srv-prod ran the *original,
+untuned* flow (every processor at `Concurrent Tasks=1`, no
+`AvroSchemaRegistry`, no `MergeContent`/`ExecuteSQL`, default backpressure)
+for that whole window. Diagnosing the live flow via the REST API (`GET
+/nifi-api/flow/process-groups/root`, `.../controller-services`,
+`/nifi-api/controller/config`) before assuming srv-dev's fixes had propagated
+surfaced four bugs specific to srv-prod's copy of the flow, two of which were
+silently destroying/dropping data in production:
+
+1. **`RouteOnAttribute`'s `upsert` condition was still
+   `${stream:equals('donation_goals')}`**, not the
+   `${stream:in('donation_goals', 'emote_catalog')}` fix already dated
+   2026-09-02 in step 4 above and already correct in
+   `flow-templates/zevent-ingest-flow.json` — the template fix was never
+   applied to the running instance. Every `emote_catalog` row was falling
+   through to `unmatched` and dead-lettering instead of upserting.
+2. **The `UpdateAttribute` dead-letter uniquifier (step 7a) didn't exist on
+   srv-prod at all** — every failure/unmatched relationship routed straight
+   into `PutFile`, which fails on the filename collision described in step
+   7a's own header (`SplitJson` gives every row from one batch the same
+   filename). This was silently destroying all but the first failing row of
+   any batch, exactly the bug step 7a documents fixing — it had just never
+   been fixed on this instance.
+3. **`EvaluateJsonPath`'s `failure` relationship was auto-terminated**, not
+   wired to the dead-letter path per step 3's own instruction — malformed
+   JSON POSTed to `ListenHTTP` was silently dropped, not even reaching
+   dead-letter.
+4. **`PutDatabaseRecord (UPSERT)`'s `Table Name` and `Update Keys` were
+   hardcoded to `donation_goals`'s literal values** (`bronze_donation_goals`
+   / `participation_id, goal_id`) instead of step 6b's stream-conditional
+   expression. This had zero visible effect until bug #1 above was fixed —
+   `emote_catalog` rows never reached this processor before then — but once
+   fixed, every `emote_catalog` upsert started failing with `Record does not
+   have a value for the Required column 'participation_id'`, since it was
+   being forced into `bronze_donation_goals` regardless of stream.
+   `donation_goals` itself "worked" the whole time only because the
+   hardcoded values happened to be exactly what it needed.
+
+Fixed in that order (#1 and #2 as one change, #3 alongside them, #4 as a
+follow-up once testing every stream's schema surfaced it) via the REST API,
+stop → fix → restart, same pattern as the concurrency/pool/backpressure
+changes above. Verified with the same manual `curl .../ingest` checks step
+2's "Verifying it end-to-end" section describes, plus a per-stream round
+trip through all 5 Avro schemas once `AvroSchemaRegistry` was added — that's
+what caught bug #4, which a live-traffic-only check could have missed for a
+long time given how rarely `emote_catalog` batches occur.
+
+### Stability findings and stress-test validation
+
+Relocated here from README.md's "Performance" section, which now keeps only
+a compact summary — this is the full detail behind those numbers.
+
+**srv-dev, 2026-08-30:**
+
+- **Content-repository archive throttling is a whole-partition check, not a
+  NiFi-specific one.** `nifi.content.repository.archive.max.usage.percentage`
+  compares against the entire filesystem NiFi's content repo lives on — on a
+  disk already >50% full from unrelated data, sustained high-volume writes
+  stall (`Unable to write flowfile content ... waiting for archive cleanup`)
+  regardless of how little NiFi itself has archived. Hit this on `srv-dev`
+  (a shared 38GB disk, ~69% used from non-NiFi data) well before NiFi's own
+  footprint was meaningful (its archive was 1.64MB at the time).
+- **Deep queues degrade throughput non-linearly.** Once a connection's queue
+  passes NiFi's in-memory swap threshold (20,000 flowfiles), it starts
+  swapping to disk; a backlog that oscillates around that threshold causes
+  repeated swap-out/swap-in churn that dropped measured drain throughput
+  from ~3,000 rows/s to ~60 rows/s. Keeping bursts under ~10K flowfiles deep
+  (or raising the swap threshold alongside backpressure) avoids the cliff.
+- **`DBCPConnectionPool`'s `Password` property is masked (`********`) on
+  every `GET`.** Re-submitting a fetched `properties` dict verbatim on a
+  `PUT` — even to change an unrelated property like pool size — silently
+  overwrites the real password with that placeholder. Caused an
+  ~8.5-minute production DB-write outage on `srv-dev` during this testing
+  (12:45:36–12:54:05 UTC, 2026-08-30) before being caught and reverted. Any
+  future scripted config change via the NiFi API must strip or re-supply
+  sensitive properties explicitly, never round-trip them. **This recurred
+  on srv-prod on 2026-09-03 anyway** (see below) — documenting a footgun
+  once wasn't sufficient to prevent it happening again; the actual fix is
+  never spreading a fetched `properties` dict into a `PUT` body, treated as
+  a hard rule for any future scripted config change, not just a note to
+  remember.
+- The srv-dev settings above were applied live via the NiFi REST API and a
+  `nifi.properties` edit inside the running container. **Neither persists
+  past a container recreate** — `docker compose up --force-recreate` (or
+  any rebuild — a plain `docker restart` is fine) reverts both to NiFi's
+  defaults, silently re-introducing the concurrency-of-1 ceiling, unless
+  they're baked into the flow template and `docker-compose.yml`/a mounted
+  `nifi.properties` respectively (which is what steps 1-8 and
+  `docker-compose.yml`'s `NIFI_JVM_HEAP_*`/entrypoint script now do).
+
+**srv-prod, 2026-09-03 (production validation):**
+
+The full tuning set above — concurrency, backpressure (raised further to
+500,000/2GB), `DBCPConnectionPool` pool size, instance thread count,
+`AvroSchemaRegistry`/schema validation, `MergeContent`/`ExecuteSQL` — plus
+the four bugs in "srv-prod drift found and fixed" above, were applied to
+srv-prod's live flow via the same REST-API approach (scripted stop → update
+→ restart). `stress_test.py --url http://localhost:8888/ingest` (default
+stages) run directly against srv-prod while it was serving real traffic:
+
+| Concurrency | Requests | Rows accepted | Errors | p50/p95/p99 ms | req/s | rows/s |
+|---|---|---|---|---|---|---|
+| 1 | 25,211 | 504,220 | 0% | 0/1/2 | 1,680.7 | 33,614.7 |
+| 2 | 37,691 | 753,820 | 0% | 1/2/4 | 2,512.7 | 50,254.7 |
+| 5 | 63,425 | 1,268,500 | 0% | 1/3/7 | 4,228.3 | 84,566.7 |
+| 10 | 73,868 | 1,477,360 | 0% | 2/4/8 | 4,924.5 | 98,490.7 |
+| 25 | 75,958 | 1,519,160 | 0% | 4/9/18 | 5,063.9 | 101,277.3 |
+| 50 | 68,027 | 1,360,540 | 0% | 9/21/41 | 4,535.1 | 90,702.7 |
+| 100 | 65,697 | 1,313,940 | 0% | 22/32/51 | 4,379.8 | 87,596.0 |
+| 200 | 65,810 | 1,316,200 | 0% | 44/62/80 | 4,387.3 | 87,746.7 |
+
+0% request failure at every stage up to 200 concurrent producers (the
+untuned baseline fell over at 2), and 0 dead-letter files generated (4,445
+before and after). Sustained *database* write rate — direct `bronze_live_chat`
+row growth, not `stress_test.py`'s own HTTP accept count — was 3,207,161
+rows landed over 147 seconds, ≈21,800 rows/sec, meeting/slightly exceeding
+the ~15,000–20,000 rows/sec ceiling srv-dev's testing found, comfortably
+past the 6,000 TPS Zevent target. Disk went from 100GB free to 94GB free
+during the run (srv-prod has a 116GB disk, well past srv-dev's 38GB margin)
+and recovered to 99GB free after test data was cleaned up (`DELETE FROM
+bronze_live_chat WHERE channel LIKE 'stress-test-%'` — the table has no
+index on `channel`, so this needed several passes to avoid timing out on
+the ~3.2M synthetic rows; a `ctid`-batched delete works if a single
+statement keeps timing out).
+
+The `DBCPConnectionPool` masked-`Password` mistake above recurred here: a
+"Max Total Connections" update re-submitted the GET response's `********`
+placeholder as the real property value, causing an ~80-second production
+DB-write outage (07:40:38–07:41:58 UTC) before being caught and fixed.
+~4,057 rows dead-lettered during the window were identified and replayed
+through `/ingest` (idempotent via `UNIQUE(batch_id, row_number)`); 2,264 of
+them turned out to be unrelated, unrecoverable corruption from a concurrent
+processor stop/restart (all fields empty except
+`batch_id`/`row_number`/`snapshot_at`), not the password incident itself.
 
 ### Deviation from the original design: `MergeContent` after `SplitJson`, not before
 
@@ -613,6 +791,15 @@ from the local `.env`, and enable it. This is faster and less error-prone
 than following steps 1–7b by hand, but keep this doc in sync with the live
 flow anyway — the JSON isn't diffable in a PR the way code is, so a future
 change made only in the NiFi UI will silently drift from both.
+
+**Re-exported from srv-prod on 2026-09-03**, after applying and verifying
+every optimization in "Tuning for higher throughput" above plus the four
+srv-prod-specific bugs in "srv-prod drift found and fixed, 2026-09-03" — this
+supersedes the earlier srv-dev-based export. Re-scrub `Database Connection
+URL`/`Database User` back to `<POSTGRES_HOST>:<PGBOUNCER_PORT>/<POSTGRES_DB>`/
+`<DB_USER>` placeholders before committing any future re-export (`Password`
+is excluded automatically by NiFi's export — that part's never an issue,
+only the two non-sensitive connection-identity fields need manual scrubbing).
 
 ### Verifying it end-to-end
 

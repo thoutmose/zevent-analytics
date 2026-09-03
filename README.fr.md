@@ -1,7 +1,10 @@
 # zevent-analytics
 
+**Un évènement, des dons, des streamers, mais aussi des viewers et chatters.**
+
 ![Zevent](img/zevent.jpg)
 
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![uv](https://img.shields.io/badge/uv-package%20manager-DE5FE9?logo=uv&logoColor=white)
 ![TwitchIO](https://img.shields.io/badge/TwitchIO-3.x-9146FF?logo=twitch&logoColor=white)
@@ -445,119 +448,29 @@ cette note sera complétée après coup avec de vrais chiffres tirés de
 `logging/` (voir [Journalisation](#journalisation)) et de PostgreSQL
 lui-même, pas des chiffres projetés.
 
-Ce qui *a* été mesuré : un test de charge/capacité synthétique du plafond du
-pipeline d'ingestion, mené contre l'instance NiFi de dev (`srv-dev`, base
-`zevent-dev`) le 30/08/2026 via `stress_test.py` — un générateur de charge
-montante qui poste des lots `live_chat` synthétiques vers `/ingest`. Ceci
-exerce le pipeline lui-même (webhook → NiFi → Postgres), pas un vrai volume
-de chat Twitch.
+Ce qui *a* été mesuré : des tests de charge/capacité synthétiques du
+plafond du pipeline d'ingestion via `stress_test.py` — un générateur de
+charge montante qui poste des lots `live_chat` synthétiques vers `/ingest`.
+Ceci exerce le pipeline lui-même (webhook → NiFi → Postgres), pas un vrai
+volume de chat Twitch, mais le run en production ci-dessous a utilisé la
+même infrastructure srv-prod réelle que le trafic du Zevent frappera.
 
-**Cette section est le premier round de ces tests et reste telle quelle
-comme trace historique — les rounds suivants (le changement
-`bronze_live_chat_staging`, le seuil de backpressure passant de 50 000 à
-500 000, et la découverte sur l'épuisement disque en charge soutenue qui le
-nuance) sont documentés dans
-[`ARCHITECTURE.md`, "Tuning for higher
-throughput"](ARCHITECTURE.md#tuning-for-higher-throughput) plutôt qu'ici —
-ce sont les chiffres actuels, ceci est leur origine.**
+| | Ligne de base non ajustée | Après réglage srv-dev (30/08/2026) | srv-prod, validé (03/09/2026) |
+|---|---|---|---|
+| Propre (0% d'erreur) jusqu'à | 1 producteur concurrent | 25 producteurs concurrents | **200 producteurs concurrents** |
+| Débit d'écriture en base soutenu | ~4 400 lignes/s (1 producteur seulement) | ~2 700–3 000 lignes/s | **~21 800 lignes/s** |
+| Taux de dead-letter en charge | n/a | n/a | 0 |
 
-### Ligne de base (réglages NiFi par défaut, non ajustés)
-
-Chaque processeur du flow a par défaut `Concurrent Tasks = 1` chez NiFi ; le
-`DBCPConnectionPool` a par défaut `Max Total Connections = 8` ; chaque
-connexion inter-processeurs a par défaut un seuil de backpressure de 10 000
-flowfiles.
-
-- **1 producteur concurrent :** ~220 req/s (~4 400 lignes/s) acceptées, 0%
-  d'erreurs, en régime soutenu.
-- **≥2 producteurs concurrents :** HTTP 503 immédiat de `ListenHTTP`, en
-  ~5ms — confirmé via la réponse servlet et les logs de NiFi lui-même, pas
-  un artefact côté client. Cause racine : avec chaque processeur plafonné à
-  1 tâche concurrente, la file juste en aval de `ListenHTTP` se remplit
-  presque instantanément, et `ListenHTTP` commence à rejeter carrément les
-  nouvelles connexions au lieu de les mettre en attente.
-- **Risque pratique que ça expose :** `zevent-main.service`,
-  `zevent-api.service`, et `zevent-donation-goals.service` poussent tous
-  vers le même `NIFI_WEBHOOK_URL` indépendamment. `nifi_client.push_batch`
-  ne retente volontairement pas un rejet HTTP définitif (seulement les
-  timeouts ambigus — voir [Mécanismes de
-  fiabilité](#mécanismes-de-fiabilité)), donc deux services qui postent au
-  même instant pourraient silencieusement perdre un lot sous ce réglage par
-  défaut non ajusté.
-
-### Après réglage
-
-Changements appliqués en direct via l'API REST de NiFi (voir la mise en
-garde sur la persistance ci-dessous) :
-
-| Réglage | Avant | Après |
-|---|---|---|
-| Concurrent Tasks de `ListenHTTP` / `PutDatabaseRecord (INSERT)` | 1 | 8 |
-| Concurrent Tasks de `EvaluateJsonPath` / `RouteOnAttribute` / `SplitJson (insert)` | 1 | 4 |
-| Concurrent Tasks de `SplitJson (upsert)` / `PutDatabaseRecord (UPSERT)` / processeurs dead-letter | 1 | 2 |
-| Max Total Connections de `DBCPConnectionPool` | 8 | 24 |
-| Seuil objet de backpressure de connexion | 10 000 | 50 000 |
-| `nifi.content.repository.archive.max.retention.period` | 7 jours | 2 minutes |
-| `nifi.content.repository.archive.max.usage.percentage` | 50% | 90% |
-
-Résultats :
-
-- **Acceptation webhook :** propre (0% d'erreurs) jusqu'à une concurrence de
-  25, ~162 850 lignes/s, latence p50/p95/p99 de 7/12/22ms.
-- **Le plafond a bougé, pas disparu :** le taux d'erreur dépasse 20% à une
-  concurrence de 50 ; saturation complète (100% d'erreurs) à une concurrence
-  de 100. Le point de rupture est passé de « n'importe quelle 2e connexion
-  concurrente » à environ 25-50 producteurs concurrents.
-- **Débit d'insertion en base soutenu, en régime établi : ~2 700-3 000
-  lignes/s**, mesuré directement contre la croissance des lignes de
-  `bronze_live_chat` (pas seulement l'acceptation côté HTTP) —
-  confortablement au-dessus du pic de ~190 msg/s estimé dans [Mécanismes de
-  fiabilité](#mécanismes-de-fiabilité).
-
-### Constats de stabilité
-
-- **La limitation d'archive du content-repository est une vérification sur
-  toute la partition, pas spécifique à NiFi.**
-  `nifi.content.repository.archive.max.usage.percentage` compare contre tout
-  le système de fichiers sur lequel vit le content repository de NiFi — sur
-  un disque déjà >50% plein à cause de données sans rapport, des écritures
-  soutenues à fort volume se bloquent (`Unable to write flowfile content ...
-  waiting for archive cleanup`) peu importe le peu que NiFi lui-même a
-  archivé. Rencontré sur `srv-dev` (un disque partagé de 38 Go, ~69%
-  utilisé par des données hors NiFi) bien avant que l'empreinte propre de
-  NiFi ne soit significative (son archive faisait 1,64 Mo à ce moment-là).
-- **Les files profondes dégradent le débit de façon non linéaire.** Une
-  fois qu'une file de connexion dépasse le seuil de swap en mémoire de NiFi
-  (10 000 flowfiles), elle commence à swapper sur disque ; un arriéré qui
-  oscille autour de ce seuil provoque un va-et-vient répété de
-  swap-out/swap-in qui a fait chuter le débit de vidange mesuré d'environ
-  3 000 lignes/s à ~60 lignes/s. Garder les rafales sous ~10K flowfiles de
-  profondeur (ou relever le seuil de swap en même temps que la
-  backpressure) évite cette falaise.
-- **La propriété `Password` de `DBCPConnectionPool` est masquée
-  (`********`) à chaque `GET`.** Renvoyer un dict `properties` récupéré tel
-  quel dans un `PUT` — même pour changer une propriété sans rapport comme
-  la taille du pool — écrase silencieusement le vrai mot de passe par ce
-  placeholder. A causé une coupure d'écriture en base de production d'environ
-  8,5 minutes sur `srv-dev` pendant ce test (12:45:36–12:54:05 UTC,
-  30/08/2026) avant d'être repérée et annulée. Tout futur changement de
-  config scripté via l'API NiFi doit retirer ou re-fournir explicitement les
-  propriétés sensibles, jamais les faire simplement l'aller-retour.
-
-### Mises en garde
-
-- Ce sont des chiffres de capacité synthétiques venant de `srv-dev`, pas du
-  vrai trafic Zevent — les chiffres du vrai événement notés en haut de
-  cette section restent à venir.
-- Les réglages ajustés ci-dessus ont été appliqués en direct via l'API REST
-  de NiFi et une édition de `nifi.properties` à l'intérieur du conteneur en
-  marche. **Aucun des deux n'est persistant** — recréer le conteneur
-  (`docker compose up --force-recreate`, ou toute reconstruction — un simple
-  `docker restart` ne pose pas de problème) ramène les deux aux valeurs par
-  défaut de NiFi, réintroduisant silencieusement le plafond de concurrence
-  à 1. Si ces réglages doivent être permanents, ils doivent être déplacés
-  dans le template de flow (`flow-templates/zevent-ingest-flow.json`) et
-  dans `docker-compose.yml`/un `nifi.properties` monté, respectivement.
+**Prêt pour le Zevent au 03/09/2026 :** 0% d'échec de requête jusqu'à 200
+producteurs concurrents et ~21 800 lignes/s soutenues vers
+`bronze_live_chat` sur srv-prod — confortablement au-delà de la cible de
+6 000 TPS. La méthodologie complète, le mode d'échec de la ligne de base
+non ajustée, chaque changement de réglage appliqué, et l'historique des
+incidents derrière ces chiffres (dont deux coupures de production
+rencontrées en chemin) sont dans
+[`ARCHITECTURE.md`, "Stability findings and stress-test
+validation"](ARCHITECTURE.md#stability-findings-and-stress-test-validation)
+(en anglais).
 
 ## Structure du projet
 
@@ -931,7 +844,8 @@ Tout ce qui précède est censé passer proprement sur chaque fichier de ce
 dépôt — CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
 exécute les mêmes vérifications, plus le lint OpenAPI, la validation
 `docker-compose.yml`/YAML, et le scan de secrets, à chaque push et pull
-request. CD ([`.github/workflows/cd.yml`](.github/workflows/cd.yml))
+request. Voir [`CONTRIBUTING.md`](CONTRIBUTING.md) (en anglais) pour le
+workflow local complet. CD ([`.github/workflows/cd.yml`](.github/workflows/cd.yml))
 déploie la stack NiFi, les extracteurs Python, `dbt/`, et les scripts
 d'archivage vers srv-prod après le succès de CI sur `main` — en appliquant
 chaque migration de `sql/` contre srv-db, en redémarrant NiFi sans condition
