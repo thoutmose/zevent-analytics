@@ -12,6 +12,10 @@ sources:
     tables:
       - name: bronze_live_chat
         description: One row per chat message, any channel (main.py, IRC).
+        loaded_at_field: ingested_at
+        freshness:
+          warn_after: {count: 15, period: minute}
+          error_after: {count: 60, period: minute}
         columns:
           - name: id
             tests:

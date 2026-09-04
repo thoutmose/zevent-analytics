@@ -337,7 +337,7 @@ class ChatConnection:
         """Opens one IRC websocket, joins every channel in this shard, and
         reads chat forever."""
         async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(IRC_WS_URL) as ws:
+            async with session.ws_connect(IRC_WS_URL, heartbeat=30) as ws:
                 await ws.send_str("CAP REQ :twitch.tv/tags")
                 await ws.send_str("PASS SCHMOOPIIE")
                 await ws.send_str(f"NICK justinfan{random.randint(10000, 99999)}")
