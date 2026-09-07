@@ -2,6 +2,8 @@
 -- velocity (€/min) that actually shows which moments moved money — per
 -- streamer, per day, and event-wide (total_donation_amount_eur/
 -- total_viewer_count, denormalized onto every row from the parent snapshot).
+{{ config(indexes=[{'columns': ['twitch_login', 'ingested_at']}]) }}
+
 select
     twitch_login,
     display_name,

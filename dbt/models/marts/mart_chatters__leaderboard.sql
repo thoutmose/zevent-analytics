@@ -14,6 +14,7 @@ with per_chatter_totals as (
 
 select
     a.chatter_id,
+    ca.chatter,
     a.channel,
     a.message_count,
     a.active_hours,
@@ -25,3 +26,4 @@ select
     rank() over (order by t.total_message_count desc) as rank_global
 from {{ ref('int_chat__chatter_channel_activity') }} as a
 inner join per_chatter_totals as t on a.chatter_id = t.chatter_id
+left join {{ ref('int_chat__chatter_activity') }} as ca on a.chatter_id = ca.chatter_id

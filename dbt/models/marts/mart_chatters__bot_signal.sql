@@ -2,6 +2,8 @@
 -- gap_coefficient_of_variation (suspiciously regular posting rhythm) plus a
 -- digit-suffixed login plus a brand-new account is worth a human look, none
 -- of the three alone proves anything.
+{{ config(indexes=[{'columns': ['chatter_id'], 'unique': True}]) }}
+
 with regularity as (
     select
         chatter_id,

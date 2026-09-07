@@ -1,6 +1,8 @@
 -- Leaderboard volatility: who climbed, who dropped, and how often the top
 -- 10 actually changed — a different (and more narratively useful) signal
 -- than donation totals alone.
+{{ config(indexes=[{'columns': ['twitch_login', 'ingested_at']}]) }}
+
 select
     twitch_login,
     display_name,

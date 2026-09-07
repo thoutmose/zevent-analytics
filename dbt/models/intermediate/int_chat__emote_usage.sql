@@ -31,19 +31,49 @@ third_party_tokens as (
     where lc.message_text is not null and lc.message_text != ''
 ),
 
-third_party as (
+-- Split out of the join condition below (was a single `t.channel = ec.channel
+-- or ec.channel = '__global__'`): an OR across two columns stops Postgres
+-- from hash-joining on a clean equality key, so it re-checks the channel
+-- condition per token/catalog-row pair instead — on this table's row counts
+-- that turned a few-second model into one that ran 14+ minutes without
+-- finishing. t.channel is always a real channel name (never '__global__'),
+-- so the two branches below can never double-match the same catalog row.
+third_party_matches as (
     select
         t.channel,
         t.hour_bucket,
         ec.service,
-        ec.emote_id,
-        count(*) as usage_count
+        ec.emote_id
     from third_party_tokens as t
     inner join {{ ref('stg_bronze__emote_catalog') }} as ec
         on
             t.token = ec.emote_code
             and ec.service in ('7tv', 'bttv', 'ffz')
-            and (t.channel = ec.channel or ec.channel = '__global__')
+            and t.channel = ec.channel
+
+    union all
+
+    select
+        t.channel,
+        t.hour_bucket,
+        ec.service,
+        ec.emote_id
+    from third_party_tokens as t
+    inner join {{ ref('stg_bronze__emote_catalog') }} as ec
+        on
+            t.token = ec.emote_code
+            and ec.service in ('7tv', 'bttv', 'ffz')
+            and ec.channel = '__global__'
+),
+
+third_party as (
+    select
+        channel,
+        hour_bucket,
+        service,
+        emote_id,
+        count(*) as usage_count
+    from third_party_matches
     group by 1, 2, 3, 4
 )
 

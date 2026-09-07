@@ -3,8 +3,11 @@
 -- but never analyzed anywhere until this model. "now()" as the reference
 -- point is fine for a bucket this coarse (day-of-query doesn't change which
 -- bucket a multi-month-old account falls into).
+{{ config(indexes=[{'columns': ['chatter_id'], 'unique': True}]) }}
+
 select
     ca.chatter_id,
+    ca.chatter,
     ca.account_created_at,
     p.chatter_profile,
     p.distinct_channel_count,

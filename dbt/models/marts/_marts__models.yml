@@ -107,13 +107,13 @@ models:
     description: Account-age bucket per chatter, cross-tabbed against channel-count profile.
 
   - name: mart_chatters__retention
-    description: Day-over-day chatter presence — is_new_today vs. returning.
+    description: 15-minute-bucket chatter presence — is_new_this_quarter_hour vs. returning.
     tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:
             combination_of_columns:
               - chatter_id
-              - day_bucket
+              - quarter_hour_bucket
 
   - name: mart_chat__new_chatters_per_channel
     description: New-to-channel chatters per day — a channel's chat-audience growth signal.
@@ -218,3 +218,59 @@ models:
 
   - name: mart_event__phase_segmentation
     description: Opening/middle/final-push donation velocity by relative position in the observed time span.
+
+  - name: mart_event__mode_timeline
+    description: Duration and donation/viewer movement for each zevent.fr website_mode segment.
+
+  - name: mart_streams__liveness_reconciliation
+    description: Cross-checks Helix's is_live against zevent.fr's self-reported is_online per streamer.
+
+  - name: mart_streamers__downtime_patterns
+    description: Break/downtime patterns per streamer — count, average/longest/shortest gap between sessions.
+    columns:
+      - name: channel
+        tests:
+          - unique
+          - not_null
+
+  - name: mart_chat__emote_catalog_utilization
+    description: Registered-vs-used emote inventory per (channel, service) — dead vs. live catalog inventory.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - channel
+              - service
+
+  - name: mart_community__streamer_support_network
+    description: Directed peer-support graph — which Zevent streamer chatted in which other streamer's channel.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - supporting_streamer_login
+              - supported_channel
+
+  - name: mart_event__phase_totals
+    description: Donation totals per event phase (opening/middle/final_push) — precomputed rollup of mart_event__phase_segmentation.
+    columns:
+      - name: event_phase
+        tests:
+          - unique
+          - not_null
+
+  - name: mart_chatters__day1_retention_curve
+    description: Cohort retention curve — active chatter count and retention_pct by day_index since first activity.
+    columns:
+      - name: day_index
+        tests:
+          - unique
+          - not_null
+
+  - name: mart_chatters__enriched
+    description: One row per chatter — profile, bot-signal, account-age, and breadth/depth/lifespan joined once.
+    columns:
+      - name: chatter_id
+        tests:
+          - unique
+          - not_null

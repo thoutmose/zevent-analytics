@@ -3,6 +3,8 @@
 -- counterpart to the community network marts, and distinct from
 -- mart_chatters__retention (day-spread) or mart_chatters__profile
 -- (channel-count bucket only).
+{{ config(indexes=[{'columns': ['chatter_id'], 'unique': True}]) }}
+
 select
     chatter_id,
     chatter,
