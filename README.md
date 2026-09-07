@@ -381,7 +381,10 @@ multi-channel rewrite:
   somewhere in `[backoff, 2*backoff]`, capped at 60s, not exactly
   `backoff`), so one flaky connection only affects its own shard, and a
   shared outage across shards doesn't send every one of them back to
-  Twitch in lockstep.
+  Twitch in lockstep. The websocket also carries a 30s `heartbeat` so a
+  dead-but-unclosed connection actually triggers this reconnect logic
+  instead of blocking forever — added after a real ~7h20m silent chat-
+  capture stall; see [`INCIDENT.md`](INCIDENT.md#2026-09-04--irc-chat-capture-silently-stalled-for-7h20m-no-heartbeat).
 - **Zevent API checkpoint** — [`zevent_api.py`](zevent_api.py) has no
   Parquet dual-write, so `_write_checkpoint` persists the last
   successfully fetched snapshot to `ZEVENT_CHECKPOINT_PATH` (default
@@ -468,6 +471,7 @@ validation"](ARCHITECTURE.md#stability-findings-and-stress-test-validation).
 ├── openapi.yaml                          # every external Twitch API call, documented
 ├── ARCHITECTURE.md                         # target production pipeline, in depth
 ├── DEPLOYMENT.md                             # CD setup: secrets, srv-prod access
+├── INCIDENT.md                                # production incident log
 ├── .github/workflows/                          # CI, CD (srv-prod), dbt (manual)
 └── data/                                         # local Parquet output (gitignored)
 ```
@@ -865,10 +869,16 @@ already covered in [Reliability mechanisms](#reliability-mechanisms) and
 - **PgBouncer's own pool sizing is still unverified under real load.**
   NiFi's per-connection backpressure and its `DBCPConnectionPool` sizing
   have now been synthetically load-tested (see
-  [Performance](#performance) — ~2,700–3,000 rows/s sustained), but that
-  only exercises NiFi's side of the JDBC connection; PgBouncer's own pool
+  [Performance](#performance) — ~21,800 rows/s sustained on srv-prod), but
+  that only exercises NiFi's side of the JDBC connection; PgBouncer's own pool
   config on `srv-db` (not managed by this repo) against that same
   throughput hasn't been separately verified.
+- **dbt's larger models can spill sorts/hashes to disk under srv-db's
+  ingestion-sized `work_mem` (32MB).** No Postgres role exists that's
+  dedicated to dbt — it shares `zevent_user` with NiFi ingestion — so
+  raising `work_mem` for dbt alone would need either a new role or a
+  session-scoped `SET` in a dbt hook, neither applied yet; see
+  [`INCIDENT.md`](INCIDENT.md#2026-09-05-evening--repeated-full-table-scans-of-bronze_live_chat-and-unresolved-work_mem-spill-on-dbt-runs).
 
 ## Data transformation (dbt)
 
@@ -891,16 +901,20 @@ uv run dbt build   # runs every model + test, staging through marts
 ```
 
 - **`stg_bronze__*`** (5 models): 1:1 typed views over each `bronze_*`
-  table, plus one real transformation —
-  `stg_bronze__zevent_snapshots` unnests the `streamers` jsonb array into
-  one row per streamer per snapshot.
-- **`int_*`** (15 models): the actual joins/window functions/aggregations —
+  table — except `stg_bronze__live_chat`, materialized as a table since 14
+  downstream refs against a view each re-scanned the full 2GB source table
+  per `dbt build`; see
+  [`INCIDENT.md`](INCIDENT.md#2026-09-05-evening--repeated-full-table-scans-of-bronze_live_chat-and-unresolved-work_mem-spill-on-dbt-runs) —
+  plus one real transformation — `stg_bronze__zevent_snapshots` unnests the
+  `streamers` jsonb array into one row per streamer per snapshot.
+- **`int_*`** (19 models): the actual joins/window functions/aggregations —
   donation deltas and leaderboard rank from successive snapshots, hourly
   chat/viewership rollups, chatter-level and chatter×channel aggregates,
   emote usage (native Twitch + third-party token-matched against
-  `bronze_emote_catalog`), inferred channel-hops, and event-wide
-  channel-pair audience overlap (Jaccard).
-- **`mart_*`** (33 models): the actual analysis surface — see below.
+  `bronze_emote_catalog`) and catalog coverage, inferred channel-hops,
+  event-wide channel-pair audience overlap (Jaccard), streamer session gaps,
+  zevent.fr's own website_mode changes, and streamer-to-streamer peer chat.
+- **`mart_*`** (38 models): the actual analysis surface — see below.
 
 Two project-level `vars` (`dbt/dbt_project.yml`) keep judgment calls tunable
 without touching SQL: `chatter_profile_*_max_channels` (the
@@ -957,10 +971,10 @@ before this layer existed).
 | Topic | Marts | Covers |
 |---|---|---|
 | Donations | `donations__timeseries`, `donations__by_title`, `donations__normalized`, `donations__spike_moments`, `donations__rank_churn`, `donations__reconciliation`, `donation_goals__current`, `donation_goals__by_category`, `donations__goal_ambition_vs_reality` | Totals + velocity over time, which titles/categories drew the most, per-viewer/per-chatter efficiency, the biggest velocity spikes with context, leaderboard volatility, event-total-vs-sum-of-parts data-quality check, current goals and their categories |
-| Chat | `chat__engagement_vs_donations`, `chat__emote_trends`, `chat__new_chatters_per_channel`, `chat__badge_and_verbosity`, `chat__spikes` | Message volume vs. donation velocity (the sizing assumption behind this project's own reliability model, tested against real data), emote trends (native + 7TV/BetterTTV/FrankerFaceZ), chat-audience growth per channel, badge/subscriber population mix and verbosity, per-channel activity spikes (z-score against the channel's own baseline) |
+| Chat | `chat__engagement_vs_donations`, `chat__emote_trends`, `chat__emote_catalog_utilization`, `chat__new_chatters_per_channel`, `chat__badge_and_verbosity`, `chat__spikes` | Message volume vs. donation velocity (the sizing assumption behind this project's own reliability model, tested against real data), emote trends (native + 7TV/BetterTTV/FrankerFaceZ), registered-vs-used emote inventory per channel/service, chat-audience growth per channel, badge/subscriber population mix and verbosity, per-channel activity spikes (z-score against the channel's own baseline) |
 | Chatters | `chatters__profile`, `chatters__leaderboard`, `chatters__account_age_profile`, `chatters__retention`, `chatters__breadth_depth_lifespan`, `chatters__bot_signal` | sedentaire/multi_streamer/semi_nomade/nomade classification, per-channel and event-wide rank, account-age buckets, day-over-day return behavior, breadth-vs-depth and lifespan, weak bot/throwaway-account signals (not a classifier) |
-| Streamers/streams | `streamers__profile`, `streamers__diurnal_profile`, `streamers__night_shift`, `streams__viewership_timeseries`, `streams__category_timeline`, `streams__session_analysis`, `streams__category_cooccurrence`, `streams__concurrency_vs_performance` | One-row-per-streamer summary (donations/chat/viewership/uptime/category diversity in one place), viewer count indexed against the event-wide hour-of-day baseline (separates "big at 9pm" from genuinely outsized), overnight donation efficiency, viewer rank over time, category/title change annotations, per-session duration/viewer-decay/chat-pace/donations, which games were played simultaneously across channels, concurrency vs. per-channel performance |
-| Community/cross-cutting | `community__channel_network`, `community__hourly_network`, `community__chatter_migrations`, `event__daily_rollup`, `event__phase_segmentation` | Event-wide channel-to-channel audience overlap (Jaccard — which streamers effectively share one audience), hourly version of the same, inferred channel-hop flow graph (closest available proxy to the raid data EventSub would have given), daily rollup across the event, opening/middle/final-push donation velocity segmentation |
+| Streamers/streams | `streamers__profile`, `streamers__diurnal_profile`, `streamers__night_shift`, `streamers__downtime_patterns`, `streams__viewership_timeseries`, `streams__category_timeline`, `streams__session_analysis`, `streams__category_cooccurrence`, `streams__concurrency_vs_performance`, `streams__liveness_reconciliation` | One-row-per-streamer summary (donations/chat/viewership/uptime/category diversity in one place), viewer count indexed against the event-wide hour-of-day baseline (separates "big at 9pm" from genuinely outsized), overnight donation efficiency, break/downtime patterns between sessions, viewer rank over time, category/title change annotations, per-session duration/viewer-decay/chat-pace/donations, which games were played simultaneously across channels, concurrency vs. per-channel performance, Helix-vs-zevent.fr liveness cross-check |
+| Community/cross-cutting | `community__channel_network`, `community__hourly_network`, `community__chatter_migrations`, `community__streamer_support_network`, `event__daily_rollup`, `event__phase_segmentation`, `event__mode_timeline` | Event-wide channel-to-channel audience overlap (Jaccard — which streamers effectively share one audience), hourly version of the same, inferred channel-hop flow graph (closest available proxy to the raid data EventSub would have given), directed streamer-to-streamer peer-chat graph, daily rollup across the event, opening/middle/final-push donation velocity segmentation, zevent.fr's own website_mode phases with donation/viewer movement per segment |
 
 Two things every mart in this table inherits from what's underneath it,
 worth restating here rather than only in each model's own comment: they

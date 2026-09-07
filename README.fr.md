@@ -938,10 +938,18 @@ et [Limitations connues](#limitations-connues) ci-dessus :
   dimensionnement du pool PgBouncer, lui, reste non vérifié en charge
   réelle.** La backpressure par connexion de NiFi et le dimensionnement de
   son `DBCPConnectionPool` ont maintenant été testés en charge de façon
-  synthétique (voir [Performance](#performance) — ~2 700-3 000 lignes/s en
-  régime soutenu), mais ça n'exerce que le côté NiFi de la connexion JDBC ;
+  synthétique (voir [Performance](#performance) — ~21 800 lignes/s en
+  régime soutenu sur srv-prod), mais ça n'exerce que le côté NiFi de la
+  connexion JDBC ;
   la config propre du pool de PgBouncer sur `srv-db` (non gérée par ce
   dépôt) face à ce même débit n'a pas été vérifiée séparément.
+- **Les plus gros modèles dbt peuvent déborder sur disque (tri/hash) sous
+  le `work_mem` de srv-db, dimensionné pour l'ingestion (32MB).** Aucun
+  rôle Postgres n'est dédié à dbt — il partage `zevent_user` avec
+  l'ingestion NiFi — donc augmenter `work_mem` pour dbt seul demanderait
+  soit un nouveau rôle, soit un `SET` scopé à la session dans un hook dbt,
+  ni l'un ni l'autre appliqué pour l'instant ; voir
+  [`INCIDENT.md`](INCIDENT.md#2026-09-05-evening--repeated-full-table-scans-of-bronze_live_chat-and-unresolved-work_mem-spill-on-dbt-runs).
 
 ## Transformation des données (dbt)
 
@@ -966,17 +974,22 @@ uv run dbt build   # exécute chaque modèle + test, de staging à marts
 ```
 
 - **`stg_bronze__*`** (5 modèles) : des vues 1:1 typées sur chaque table
-  `bronze_*`, plus une vraie transformation —
-  `stg_bronze__zevent_snapshots` déplie le tableau jsonb `streamers` en
-  une ligne par streamer par snapshot.
-- **`int_*`** (15 modèles) : les vraies jointures/fonctions
+  `bronze_*` — sauf `stg_bronze__live_chat`, matérialisée en table car 14
+  refs en aval contre une vue re-scannaient chacune la table source
+  complète (2GB) à chaque `dbt build` ; voir
+  [`INCIDENT.md`](INCIDENT.md#2026-09-05-evening--repeated-full-table-scans-of-bronze_live_chat-and-unresolved-work_mem-spill-on-dbt-runs) —
+  plus une vraie transformation — `stg_bronze__zevent_snapshots` déplie le
+  tableau jsonb `streamers` en une ligne par streamer par snapshot.
+- **`int_*`** (19 modèles) : les vraies jointures/fonctions
   fenêtrées/agrégations — deltas de dons et rang au classement depuis des
   snapshots successifs, agrégations horaires de chat/viewers, agrégats au
   niveau chatteur et chatteur×chaîne, usage des emotes (Twitch natif +
-  correspondance de token contre `bronze_emote_catalog` pour les tierces),
-  transferts de chaîne inférés, et recouvrement d'audience par paire de
-  chaînes à l'échelle de l'événement (indice de Jaccard).
-- **`mart_*`** (33 modèles) : la vraie surface d'analyse — voir plus bas.
+  correspondance de token contre `bronze_emote_catalog` pour les tierces) et
+  couverture du catalogue, transferts de chaîne inférés, recouvrement
+  d'audience par paire de chaînes à l'échelle de l'événement (indice de
+  Jaccard), écarts entre sessions de streamers, changements du
+  website_mode propre à zevent.fr, et chat entre streamers.
+- **`mart_*`** (38 modèles) : la vraie surface d'analyse — voir plus bas.
 
 Deux `vars` au niveau du projet (`dbt/dbt_project.yml`) gardent les choix
 arbitraires réglables sans toucher au SQL : `chatter_profile_*_max_channels`
@@ -1038,10 +1051,10 @@ agrégées esquissée avant que cette couche n'existe).
 | Sujet | Marts | Couvre |
 |---|---|---|
 | Dons | `donations__timeseries`, `donations__by_title`, `donations__normalized`, `donations__spike_moments`, `donations__rank_churn`, `donations__reconciliation`, `donation_goals__current`, `donation_goals__by_category`, `donations__goal_ambition_vs_reality` | Totaux + vélocité dans le temps, quels titres/catégories ont attiré le plus, efficacité par viewer/par chatteur, les plus gros pics de vélocité avec contexte, volatilité du classement, vérification qualité total-événement-vs-somme-des-parties, objectifs actuels et leurs catégories |
-| Chat | `chat__engagement_vs_donations`, `chat__emote_trends`, `chat__new_chatters_per_channel`, `chat__badge_and_verbosity`, `chat__spikes` | Volume de messages vs. vélocité des dons (l'hypothèse de dimensionnement derrière le propre modèle de fiabilité de ce projet, testée contre de vraies données), tendances d'emotes (natives + 7TV/BetterTTV/FrankerFaceZ), croissance de l'audience de chat par chaîne, mix badge/abonné et verbosité, pics d'activité par chaîne (z-score contre la propre référence de la chaîne) |
+| Chat | `chat__engagement_vs_donations`, `chat__emote_trends`, `chat__emote_catalog_utilization`, `chat__new_chatters_per_channel`, `chat__badge_and_verbosity`, `chat__spikes` | Volume de messages vs. vélocité des dons (l'hypothèse de dimensionnement derrière le propre modèle de fiabilité de ce projet, testée contre de vraies données), tendances d'emotes (natives + 7TV/BetterTTV/FrankerFaceZ), inventaire d'emotes enregistrées-vs-utilisées par chaîne/service, croissance de l'audience de chat par chaîne, mix badge/abonné et verbosité, pics d'activité par chaîne (z-score contre la propre référence de la chaîne) |
 | Chatteurs | `chatters__profile`, `chatters__leaderboard`, `chatters__account_age_profile`, `chatters__retention`, `chatters__breadth_depth_lifespan`, `chatters__bot_signal` | Classification sedentaire/multi_streamer/semi_nomade/nomade, rang par chaîne et à l'échelle de l'événement, tranches d'âge de compte, comportement de retour jour après jour, largeur vs. profondeur et durée de vie, signaux faibles de bot/compte-jetable (pas un classificateur) |
-| Streamers/streams | `streamers__profile`, `streamers__diurnal_profile`, `streamers__night_shift`, `streams__viewership_timeseries`, `streams__category_timeline`, `streams__session_analysis`, `streams__category_cooccurrence`, `streams__concurrency_vs_performance` | Résumé une-ligne-par-streamer (dons/chat/viewers/uptime/diversité de catégorie en un seul endroit), nombre de viewers indexé contre la référence événementielle à cette même heure de la journée (sépare « gros à 21h » d'une performance vraiment hors norme), efficacité des dons de nuit, rang de viewers dans le temps, annotations de changement de catégorie/titre, durée/décroissance de viewers/rythme de chat/dons par session, quels jeux étaient joués simultanément sur les chaînes, concurrence vs. performance par chaîne |
-| Communauté/transversal | `community__channel_network`, `community__hourly_network`, `community__chatter_migrations`, `event__daily_rollup`, `event__phase_segmentation` | Recouvrement d'audience chaîne-à-chaîne à l'échelle de l'événement (Jaccard — quels streamers partagent effectivement une même audience), version horaire du même, graphe de flux de transferts de chaîne inférés (le meilleur proxy disponible pour la donnée de raid qu'EventSub aurait donnée), agrégation quotidienne sur l'événement, segmentation de la vélocité des dons en ouverture/milieu/dernière ligne droite |
+| Streamers/streams | `streamers__profile`, `streamers__diurnal_profile`, `streamers__night_shift`, `streamers__downtime_patterns`, `streams__viewership_timeseries`, `streams__category_timeline`, `streams__session_analysis`, `streams__category_cooccurrence`, `streams__concurrency_vs_performance`, `streams__liveness_reconciliation` | Résumé une-ligne-par-streamer (dons/chat/viewers/uptime/diversité de catégorie en un seul endroit), nombre de viewers indexé contre la référence événementielle à cette même heure de la journée (sépare « gros à 21h » d'une performance vraiment hors norme), efficacité des dons de nuit, écarts entre sessions, rang de viewers dans le temps, annotations de changement de catégorie/titre, durée/décroissance de viewers/rythme de chat/dons par session, quels jeux étaient joués simultanément sur les chaînes, concurrence vs. performance par chaîne, vérification croisée de la liveness Helix-vs-zevent.fr |
+| Communauté/transversal | `community__channel_network`, `community__hourly_network`, `community__chatter_migrations`, `community__streamer_support_network`, `event__daily_rollup`, `event__phase_segmentation`, `event__mode_timeline` | Recouvrement d'audience chaîne-à-chaîne à l'échelle de l'événement (Jaccard — quels streamers partagent effectivement une même audience), version horaire du même, graphe de flux de transferts de chaîne inférés (le meilleur proxy disponible pour la donnée de raid qu'EventSub aurait donnée), graphe dirigé de chat entre streamers, agrégation quotidienne sur l'événement, segmentation de la vélocité des dons en ouverture/milieu/dernière ligne droite, phases du website_mode de zevent.fr avec mouvement des dons/viewers par segment |
 
 Deux choses que chaque mart de ce tableau hérite de ce qu'il y a dessous,
 qui méritent d'être répétées ici plutôt que seulement dans le commentaire
